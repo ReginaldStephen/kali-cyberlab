@@ -4305,9 +4305,7 @@ app.get(
           });
         }
 
-        const selectedScannerId =
-          scannerId ||
-          "6acd0832-df90-11e4-b9d5-28d24461215b";
+        const selectedScannerId = scannerId;
 
         if (
           !/^[0-9a-fA-F-]{36}$/.test(

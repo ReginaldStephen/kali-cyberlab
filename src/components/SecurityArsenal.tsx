@@ -44,6 +44,18 @@ interface GreenboneTask {
   reportId: string | null;
 }
 
+interface GreenboneScanner {
+  id: string;
+  name: string;
+  type: number | null;
+}
+
+interface GreenboneConfig {
+  id: string;
+  name: string;
+  usageType: string;
+}
+
 interface GreenboneTasksResponse {
   statusCode: number;
   statusText: string;
@@ -247,10 +259,23 @@ const [greenboneReportError, setGreenboneReportError] =
   const [greenboneTarget, setGreenboneTarget] =
     useState("");
 
-  const [greenboneConfigId, setGreenboneConfigId] =
-    useState(
-      "daba56c8-73ec-11df-a475-002264764cea"
-    );
+  const [greenboneScanners, setGreenboneScanners] =
+  useState<GreenboneScanner[]>([]);
+
+const [greenboneConfigs, setGreenboneConfigs] =
+  useState<GreenboneConfig[]>([]);
+
+const [greenboneScannerId, setGreenboneScannerId] =
+  useState("");
+
+const [greenboneConfigId, setGreenboneConfigId] =
+  useState("");
+
+const [greenboneProfilesLoading, setGreenboneProfilesLoading] =
+  useState(false);
+
+const [greenboneProfilesError, setGreenboneProfilesError] =
+  useState<string | null>(null);
 
   const [greenboneScanStarting, setGreenboneScanStarting] =
     useState(false);
@@ -266,6 +291,157 @@ const [greenboneReportError, setGreenboneReportError] =
       taskId: string;
       reportId: string | null;
     } | null>(null);  
+
+const loadGreenboneProfiles = useCallback(async () => {
+  setGreenboneProfilesLoading(true);
+  setGreenboneProfilesError(null);
+
+  try {
+    const [scannersResponse, configsResponse] =
+      await Promise.all([
+        fetch("/api/integrations/greenbone/scanners"),
+        fetch("/api/integrations/greenbone/configs"),
+      ]);
+
+    const scannersData = await scannersResponse.json();
+    const configsData = await configsResponse.json();
+
+    if (!scannersResponse.ok) {
+      throw new Error(
+        scannersData?.error ||
+          "Failed to retrieve Greenbone scanners."
+      );
+    }
+
+    if (!configsResponse.ok) {
+      throw new Error(
+        configsData?.error ||
+          "Failed to retrieve Greenbone scan configurations."
+      );
+    }
+
+    const parser = new DOMParser();
+
+    const scannersDocument = parser.parseFromString(
+      `<root>${scannersData.xml || ""}</root>`,
+      "application/xml"
+    );
+
+    const scannerNodes = Array.from(
+      scannersDocument.querySelectorAll("scanner")
+    );
+
+    const discoveredScanners: GreenboneScanner[] =
+      scannerNodes
+        .map((scanner) => ({
+          id: scanner.getAttribute("id") || "",
+          name:
+            scanner.querySelector(":scope > name")?.textContent?.trim() ||
+            "",
+          type: Number(
+            scanner.querySelector(":scope > type")?.textContent || ""
+          ),
+        }))
+        .filter(
+          (scanner) =>
+            scanner.id &&
+            scanner.name
+        );
+
+    const configsDocument = parser.parseFromString(
+      `<root>${configsData.xml || ""}</root>`,
+      "application/xml"
+    );
+
+    const configNodes = Array.from(
+      configsDocument.querySelectorAll("config")
+    );
+
+    const discoveredConfigs: GreenboneConfig[] =
+      configNodes
+        .map((config) => ({
+          id: config.getAttribute("id") || "",
+          name:
+            config.querySelector(":scope > name")?.textContent?.trim() ||
+            "",
+          usageType:
+            config.querySelector(":scope > usage_type")?.textContent?.trim() ||
+            "",
+        }))
+        .filter(
+          (config) =>
+            config.id &&
+            config.name &&
+            config.usageType === "scan"
+        );
+
+    setGreenboneScanners(discoveredScanners);
+    setGreenboneConfigs(discoveredConfigs);
+
+    setGreenboneScannerId((currentId) => {
+      if (
+        currentId &&
+        discoveredScanners.some(
+          (scanner) => scanner.id === currentId
+        )
+      ) {
+        return currentId;
+      }
+
+      const preferredScanner =
+        discoveredScanners.find(
+          (scanner) =>
+            scanner.name.toLowerCase() ===
+            "openvas default"
+        ) ||
+        discoveredScanners.find(
+          (scanner) =>
+            scanner.name.toLowerCase().includes("openvas")
+        ) ||
+        discoveredScanners[0];
+
+      return preferredScanner?.id || "";
+    });
+
+    setGreenboneConfigId((currentId) => {
+      if (
+        currentId &&
+        discoveredConfigs.some(
+          (config) => config.id === currentId
+        )
+      ) {
+        return currentId;
+      }
+
+      const preferredConfig =
+        discoveredConfigs.find(
+          (config) =>
+            config.name.toLowerCase() ===
+              "full and fast"
+        ) ||
+        discoveredConfigs.find(
+          (config) =>
+            config.name.toLowerCase().includes("full")
+        ) ||
+        discoveredConfigs[0];
+
+      return preferredConfig?.id || "";
+    });
+  } catch (error) {
+    console.error(
+      "Failed to load Greenbone scanners/configurations:",
+      error
+    );
+
+    setGreenboneProfilesError(
+      error instanceof Error
+        ? error.message
+        : "Failed to load Greenbone scan profiles."
+    );
+  } finally {
+    setGreenboneProfilesLoading(false);
+  }
+}, []);
 
   const loadIntegrationStatuses = useCallback(async () => {
     try {
@@ -450,7 +626,19 @@ return {
       );
       return;
     }
+if (!greenboneScannerId) {
+  setGreenboneScanStartError(
+    "Greenbone scanner information is still loading."
+  );
+  return;
+}
 
+if (!greenboneConfigId) {
+  setGreenboneScanStartError(
+    "Greenbone scan configuration information is still loading."
+  );
+  return;
+}
     setGreenboneScanStarting(true);
     setGreenboneScanStartError(null);
     setGreenboneScanSuccess(null);
@@ -468,9 +656,8 @@ return {
               greenboneScanName.trim() ||
               `CyberLab Greenbone Scan - ${target}`,
             target,
-            configId: greenboneConfigId,
-            scannerId:
-              "6acd0832-df90-11e4-b9d5-28d24461215b",
+           configId: greenboneConfigId,
+scannerId: greenboneScannerId,
           }),
         }
       );
@@ -517,11 +704,12 @@ return {
       setGreenboneScanStarting(false);
     }
   }, [
-    greenboneTarget,
-    greenboneScanName,
-    greenboneConfigId,
-    loadGreenboneTasks,
-  ]);
+  greenboneTarget,
+  greenboneScanName,
+  greenboneConfigId,
+  greenboneScannerId,
+  loadGreenboneTasks,
+]);
  
  
 const parseGreenboneReport = (
@@ -790,22 +978,25 @@ const loadGreenboneReport = useCallback(
 );
 
  
-    useEffect(() => {
+ useEffect(() => {
+  loadIntegrationStatuses();
+  loadGreenboneProfiles();
+  loadGreenboneTasks();
+
+  const interval = window.setInterval(() => {
     loadIntegrationStatuses();
+    loadGreenboneProfiles();
     loadGreenboneTasks();
+  }, 30000);
 
-    const interval = window.setInterval(() => {
-      loadIntegrationStatuses();
-      loadGreenboneTasks();
-    }, 30000);
-
-    return () => {
-      window.clearInterval(interval);
-    };
-  }, [
-    loadIntegrationStatuses,
-    loadGreenboneTasks,
-  ]);
+  return () => {
+    window.clearInterval(interval);
+  };
+}, [
+  loadIntegrationStatuses,
+  loadGreenboneProfiles,
+  loadGreenboneTasks,
+]);
 
   const formatCheckedAt = (
     value: string | undefined
@@ -1239,37 +1430,81 @@ const loadGreenboneReport = useCallback(
                   "Separate multiple targets with commas."}
               </p>
             </div>
+<div>
+  <label className="mb-2 block text-[9px] font-bold uppercase tracking-wider text-slate-500">
+    Greenbone Scanner
+  </label>
 
+  <select
+    value={greenboneScannerId}
+    onChange={(event) =>
+      setGreenboneScannerId(event.target.value)
+    }
+    disabled={
+      greenboneProfilesLoading ||
+      greenboneScanners.length === 0
+    }
+    className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 font-mono text-[10px] text-white outline-none transition focus:border-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+  >
+    {greenboneScanners.length === 0 ? (
+      <option value="">
+        {greenboneProfilesLoading
+          ? "Loading Greenbone scanners..."
+          : "No scanners available"}
+      </option>
+    ) : (
+      greenboneScanners.map((scanner) => (
+        <option
+          key={scanner.id}
+          value={scanner.id}
+        >
+          {scanner.name}
+        </option>
+      ))
+    )}
+  </select>
+</div>
             <div>
               <label className="mb-2 block text-[9px] font-bold uppercase tracking-wider text-slate-500">
                 Greenbone Scan Profile
               </label>
 
               <select
-                value={greenboneConfigId}
-                onChange={(event) =>
-                  setGreenboneConfigId(event.target.value)
-                }
-                className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 font-mono text-[10px] text-white outline-none transition focus:border-emerald-500/50"
-              >
-                <option value="daba56c8-73ec-11df-a475-002264764cea">
-                  Full and fast
-                </option>
-
-                <option value="8715c877-47a0-438d-98a3-27c7a6ab2196">
-                  Discovery
-                </option>
-
-                <option value="2d3f051c-55ba-11e3-bf43-406186ea4fc5">
-                  Host Discovery
-                </option>
-
-                <option value="d21f6c81-2b88-4ac1-b7b4-a2a9f2ad4663">
-                  Base
-                </option>
-              </select>
+  value={greenboneConfigId}
+  onChange={(event) =>
+    setGreenboneConfigId(event.target.value)
+  }
+  disabled={
+    greenboneProfilesLoading ||
+    greenboneConfigs.length === 0
+  }
+  className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 font-mono text-[10px] text-white outline-none transition focus:border-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+>
+  {greenboneConfigs.length === 0 ? (
+    <option value="">
+      {greenboneProfilesLoading
+        ? "Loading Greenbone profiles..."
+        : "No scan profiles available"}
+    </option>
+  ) : (
+    greenboneConfigs.map((config) => (
+      <option
+        key={config.id}
+        value={config.id}
+      >
+        {config.name}
+      </option>
+    ))
+  )}
+</select>
             </div>
           </div>
+
+          {greenboneProfilesError && (
+  <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-3 text-[10px] text-amber-300">
+    {greenboneProfilesError}
+  </div>
+)}
 
           {greenboneScanStartError && (
             <div className="mt-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-3">
