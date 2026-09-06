@@ -1,0 +1,4683 @@
+import "dotenv/config";
+import express from "express";
+import path from "path";
+import os from "os";
+import { exec } from "child_process";
+import http from "http";
+import https from "https";
+import tls from "tls";
+import net from "net";
+import { GoogleGenAI } from "@google/genai";
+import { createServer as createViteServer } from "vite";
+
+import {
+  SystemHealth,
+  DiscoveredHost,
+  DiscoveredPort,
+  WebAuditResult,
+  VulnerabilityFinding,
+  ScanRunRecord,
+  RemediationReport,
+  IndividualScanReport,
+  TerminalExecutionResponse,
+} from "./src/types";
+
+const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+
+app.use(express.json({ limit: "2mb" }));
+
+// ============================================================
+// GLOBAL STATE
+// ============================================================
+
+const scanHistory: ScanRunRecord[] = [];
+
+// ============================================================
+// GREENBONE GMP CLIENT
+// ============================================================
+
+type GreenboneGmpResponse = {
+  statusCode: number;
+  statusText: string;
+  xml: string;
+};
+
+function runGreenboneGmpCommand(
+  xmlCommand: string,
+  timeoutMs: number = 30000
+): Promise<GreenboneGmpResponse> {
+  const socketPath =
+    process.env.GREENBONE_SOCKET ||
+    "/run/gvmd/gvmd.sock";
+
+  const username =
+    process.env.GREENBONE_USERNAME || "";
+
+  const password =
+    process.env.GREENBONE_PASSWORD || "";
+
+  return new Promise((resolve, reject) => {
+    if (!username || !password) {
+      reject(
+        new Error(
+          "Greenbone credentials are not configured."
+        )
+      );
+      return;
+    }
+
+    const socket = net.createConnection(
+      socketPath
+    );
+
+    let responseData = "";
+    let settled = false;
+
+    const finish = (
+      callback: () => void
+    ) => {
+      if (settled) return;
+
+      settled = true;
+
+      clearTimeout(timeout);
+
+      callback();
+    };
+
+    const timeout = setTimeout(() => {
+      finish(() => {
+        socket.destroy();
+
+        reject(
+          new Error(
+            "Greenbone GMP request timed out."
+          )
+        );
+      });
+    }, timeoutMs);
+
+    socket.on("connect", () => {
+      const authenticateXml = `
+<authenticate>
+  <credentials>
+    <username>${escapeXml(username)}</username>
+    <password>${escapeXml(password)}</password>
+  </credentials>
+</authenticate>`;
+
+      socket.write(authenticateXml);
+      socket.write(xmlCommand);
+    });
+
+    socket.on("data", (chunk) => {
+      responseData += chunk.toString();
+
+      if (
+  responseData.includes(
+    "</authenticate_response>"
+  ) ||
+  responseData.includes(
+    "</get_version_response>"
+  ) ||
+  responseData.includes(
+    "</get_tasks_response>"
+  ) ||
+  responseData.includes(
+    "</get_targets_response>"
+  ) ||
+  responseData.includes(
+    "</get_reports_response>"
+  ) ||
+  responseData.includes(
+    "</create_target_response>"
+  ) ||
+  responseData.includes(
+    "</create_task_response>"
+  ) ||
+  responseData.includes(
+    "</start_task_response>"
+  )
+) {
+        finish(() => {
+          const statusMatch =
+            responseData.match(
+              /status="(\d+)"/
+            );
+
+          const statusTextMatch =
+            responseData.match(
+              /status_text="([^"]*)"/
+            );
+
+          resolve({
+            statusCode: Number(
+              statusMatch?.[1] || 0
+            ),
+
+            statusText:
+              statusTextMatch?.[1] ||
+              "",
+
+            xml: responseData,
+          });
+
+          socket.end();
+        });
+      }
+    });
+
+    socket.on("error", (error) => {
+  if (settled) {
+    return;
+  }
+
+  finish(() => {
+    reject(error);
+  });
+});
+
+    socket.on("close", () => {
+      if (!settled && responseData) {
+        finish(() => {
+          const statusMatch =
+            responseData.match(
+              /status="(\d+)"/
+            );
+
+          const statusTextMatch =
+            responseData.match(
+              /status_text="([^"]*)"/
+            );
+
+          resolve({
+            statusCode: Number(
+              statusMatch?.[1] || 0
+            ),
+
+            statusText:
+              statusTextMatch?.[1] ||
+              "",
+
+            xml: responseData,
+          });
+        });
+      }
+    });
+  });
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+let isContinuousScanActive = false;
+let continuousScanIntervalSeconds = 5;
+let continuousScanTarget = "127.0.0.1";
+let continuousIntervalTimer: NodeJS.Timeout | null = null;
+
+// ============================================================
+// GEMINI CLIENT
+// ============================================================
+
+let geminiClient: GoogleGenAI | null = null;
+
+function getGeminiClient(): GoogleGenAI | null {
+  if (!geminiClient && process.env.GEMINI_API_KEY) {
+    geminiClient = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+  }
+
+  return geminiClient;
+}
+
+// ============================================================
+// SHELL COMMAND HELPER
+// ============================================================
+
+function runShellCommand(
+  cmd: string,
+  timeoutMs: number = 8000
+): Promise<{
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  durationMs: number;
+}> {
+  const start = Date.now();
+
+  return new Promise((resolve) => {
+    exec(
+      cmd,
+      {
+        timeout: timeoutMs,
+        maxBuffer: 1024 * 1024 * 5,
+        shell: "/bin/bash",
+      },
+      (error, stdout, stderr) => {
+        const durationMs = Date.now() - start;
+
+        let exitCode = 0;
+
+        if (error && typeof error.code === "number") {
+          exitCode = error.code;
+        } else if (error) {
+          exitCode = 1;
+        }
+
+        resolve({
+          stdout: stdout || "",
+          stderr: stderr || (error ? error.message : ""),
+          exitCode,
+          durationMs,
+        });
+      }
+    );
+  });
+}
+
+// ============================================================
+// COMMON PORT DEFINITIONS
+// ============================================================
+
+const COMMON_PORTS: {
+  port: number;
+  service: string;
+  protocol: "tcp" | "udp";
+}[] = [
+  { port: 21, service: "ftp", protocol: "tcp" },
+  { port: 22, service: "ssh", protocol: "tcp" },
+  { port: 23, service: "telnet", protocol: "tcp" },
+  { port: 25, service: "smtp", protocol: "tcp" },
+  { port: 53, service: "dns", protocol: "tcp" },
+  { port: 80, service: "http", protocol: "tcp" },
+  { port: 110, service: "pop3", protocol: "tcp" },
+  { port: 139, service: "netbios-ssn", protocol: "tcp" },
+  { port: 143, service: "imap", protocol: "tcp" },
+  { port: 443, service: "https", protocol: "tcp" },
+  { port: 445, service: "microsoft-ds (smb)", protocol: "tcp" },
+  { port: 993, service: "imaps", protocol: "tcp" },
+  { port: 995, service: "pop3s", protocol: "tcp" },
+  { port: 1433, service: "ms-sql-s", protocol: "tcp" },
+  { port: 1521, service: "oracle", protocol: "tcp" },
+  { port: 3000, service: "node-app", protocol: "tcp" },
+  { port: 3306, service: "mysql", protocol: "tcp" },
+  { port: 3389, service: "ms-wbt-server (rdp)", protocol: "tcp" },
+  { port: 5432, service: "postgresql", protocol: "tcp" },
+  { port: 5900, service: "vnc", protocol: "tcp" },
+  { port: 6379, service: "redis", protocol: "tcp" },
+  { port: 8080, service: "http-proxy", protocol: "tcp" },
+  { port: 8443, service: "https-alt", protocol: "tcp" },
+  { port: 9000, service: "cslistener/portainer", protocol: "tcp" },
+  { port: 27017, service: "mongodb", protocol: "tcp" },
+];
+
+// ============================================================
+// TCP PORT PROBE
+// ============================================================
+
+function probeTcpPort(
+  host: string,
+  port: number,
+  timeoutMs: number = 800
+): Promise<{
+  open: boolean;
+  banner?: string;
+  latencyMs: number;
+}> {
+  const start = Date.now();
+
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+
+    let banner = "";
+    let isResolved = false;
+
+    const finish = (
+      open: boolean,
+      includeBanner: boolean = false
+    ) => {
+      if (isResolved) return;
+
+      isResolved = true;
+
+      const latencyMs = Date.now() - start;
+
+      socket.destroy();
+
+      resolve({
+        open,
+        banner: includeBanner ? banner.slice(0, 200) : undefined,
+        latencyMs,
+      });
+    };
+
+    socket.setTimeout(timeoutMs);
+
+    socket.on("connect", () => {
+      const latencyMs = Date.now() - start;
+
+      socket.setTimeout(300);
+
+      socket.on("data", (chunk: Buffer) => {
+        banner += chunk.toString("utf8").trim();
+      });
+
+      setTimeout(() => {
+        if (!isResolved) {
+          isResolved = true;
+          socket.destroy();
+
+          resolve({
+            open: true,
+            banner: banner.slice(0, 200),
+            latencyMs,
+          });
+        }
+      }, 300);
+    });
+
+    socket.on("timeout", () => {
+      finish(false);
+    });
+
+    socket.on("error", () => {
+      finish(false);
+    });
+
+    try {
+      socket.connect(port, host);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+// ============================================================
+// UTILITY FUNCTIONS
+// ============================================================
+
+function isValidPort(port: number): boolean {
+  return Number.isInteger(port) && port >= 1 && port <= 65535;
+}
+
+function sanitizeScanTarget(target: string): string {
+  return target.replace(/[^a-zA-Z0-9.\-/:,]/g, "");
+}
+
+function addScanHistory(record: ScanRunRecord): void {
+  scanHistory.unshift(record);
+
+  if (scanHistory.length > 50) {
+    scanHistory.pop();
+  }
+}
+
+function getScanById(scanId: string): ScanRunRecord | null {
+  return (
+    scanHistory.find(
+      (scan) => scan.id === scanId
+    ) || null
+  );
+}
+
+async function collectLocalHostTelemetry(): Promise<
+  Partial<DiscoveredHost>
+> {
+  try {
+    const cpus = os.cpus();
+
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
+
+    const interfacesList =
+      Object.entries(
+        os.networkInterfaces()
+      ).flatMap(
+        ([name, addrs]) =>
+          (addrs || []).map((addr) => ({
+            name,
+            ip: addr.address,
+            mac: addr.mac,
+            netmask: addr.netmask,
+            family: addr.family,
+            internal: addr.internal,
+          }))
+      );
+
+    const [
+      diskRes,
+      socketsRes,
+      virtualizationRes,
+    ] = await Promise.all([
+      runShellCommand(
+        "df -h / 2>/dev/null"
+      ),
+
+      runShellCommand(
+        "ss -tulnp 2>/dev/null"
+      ),
+
+      runShellCommand(
+        "systemd-detect-virt 2>/dev/null || true"
+      ),
+    ]);
+
+    // --------------------------------------------------------
+    // ROOT DISK
+    // --------------------------------------------------------
+
+    let rootDisk:
+      DiscoveredHost["rootDisk"];
+
+    const diskLines =
+      diskRes.stdout
+        .trim()
+        .split("\n");
+
+    if (diskLines.length >= 2) {
+      const diskLine =
+        diskLines[diskLines.length - 1]
+          .trim();
+
+      const parts =
+        diskLine.split(/\s+/);
+
+      if (parts.length >= 6) {
+        rootDisk = {
+          filesystem: parts[0],
+          size: parts[1],
+          used: parts[2],
+          available: parts[3],
+          usePercent: parts[4],
+          mountedOn:
+            parts.slice(5).join(" "),
+        };
+      }
+    }
+
+    // --------------------------------------------------------
+    // SOCKETS
+    // --------------------------------------------------------
+
+    const sockets:
+      NonNullable<
+        DiscoveredHost["sockets"]
+      > = [];
+
+    for (
+      const line of socketsRes.stdout
+        .trim()
+        .split("\n")
+    ) {
+      if (
+        !line ||
+        line.startsWith("Netid")
+      ) {
+        continue;
+      }
+
+      const parts =
+        line.split(/\s+/);
+
+      if (parts.length < 5) {
+        continue;
+      }
+
+      const protocol =
+        parts[0];
+
+      const state =
+        parts[1];
+
+      const localEndpoint =
+        parts[4] || "";
+
+      const peerEndpoint =
+        parts[5] || "";
+
+      const parseEndpoint = (
+        endpoint: string
+      ) => {
+        const cleaned =
+          endpoint.trim();
+
+        const match =
+          cleaned.match(
+            /^(.*):(\d+)$/
+          );
+
+        if (!match) {
+          return {
+            address: cleaned,
+            port: "",
+          };
+        }
+
+        return {
+          address: match[1],
+          port: Number(match[2]),
+        };
+      };
+
+      const local =
+        parseEndpoint(
+          localEndpoint
+        );
+
+      const peer =
+        parseEndpoint(
+          peerEndpoint
+        );
+
+      sockets.push({
+        protocol,
+        state,
+        localAddress:
+          local.address,
+        localPort:
+          local.port,
+        peerAddress:
+          peer.address,
+      });
+    }
+
+    // --------------------------------------------------------
+    // VIRTUALIZATION
+    // --------------------------------------------------------
+
+     let virtualization =
+  virtualizationRes.stdout
+    .trim()
+    .toLowerCase();
+
+if (
+  !virtualization ||
+  virtualization === "none"
+) {
+  virtualization =
+    "bare metal / unknown";
+}
+
+    // --------------------------------------------------------
+    // RETURN TELEMETRY
+    // --------------------------------------------------------
+
+    return {
+       machineType: {
+  type:
+    virtualization === "kvm"
+      ? "qemu"
+      : virtualization === "vmware"
+      ? "vmware"
+      : virtualization === "oracle"
+      ? "virtualbox"
+      : virtualization === "microsoft"
+      ? "hyper-v"
+      : virtualization === "xen"
+      ? "xen"
+      : virtualization === "docker"
+      ? "container"
+      : virtualization === "bare metal / unknown"
+      ? "unknown"
+      : "unknown",
+  virtualization,
+  architecture:
+    os.arch(),
+},
+      cpu: {
+        model:
+          cpus[0]?.model ||
+          "Generic CPU",
+        cores:
+          cpus.length,
+        usagePercent:
+          cpus.length > 0
+            ? Math.min(
+                100,
+                Math.round(
+                  (os.loadavg()[0] /
+                    cpus.length) *
+                    100
+                )
+              )
+            : 0,
+        loadAverage:
+          os.loadavg(),
+      },
+
+      memory: {
+        totalBytes:
+          totalMem,
+        usedBytes:
+          usedMem,
+        freeBytes:
+          freeMem,
+        usedPercent:
+          totalMem > 0
+            ? Math.round(
+                (usedMem /
+                  totalMem) *
+                  100
+              )
+            : 0,
+      },
+
+      rootDisk,
+
+      interfaces:
+        interfacesList,
+
+      sockets,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function countVulnerabilities(findings: VulnerabilityFinding[]) {
+  return {
+    critical: findings.filter((v) => v.severity === "critical").length,
+    high: findings.filter((v) => v.severity === "high").length,
+    medium: findings.filter((v) => v.severity === "medium").length,
+    low: findings.filter((v) => v.severity === "low").length,
+    info: findings.filter((v) => v.severity === "info").length,
+  };
+}
+
+// ============================================================
+// 1. SYSTEM HEALTH
+// ============================================================
+
+app.get("/api/system/health", async (_req, res) => {
+  try {
+    const hostname = os.hostname();
+    const platform = os.platform();
+    const release = os.release();
+    const arch = os.arch();
+
+    const uptimeSeconds = os.uptime();
+
+    const days = Math.floor(uptimeSeconds / 86400);
+    const hours = Math.floor((uptimeSeconds % 86400) / 3600);
+    const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+
+    const uptimeFormatted =
+      `${days > 0 ? `${days}d ` : ""}` +
+      `${hours}h ${minutes}m`;
+
+    const cpus = os.cpus();
+    const cpuModel = cpus[0]?.model || "Generic CPU";
+    const cores = cpus.length;
+
+    const loadAverage = os.loadavg();
+
+    const cpuUsagePercent =
+      cores > 0
+        ? Math.min(
+            100,
+            Math.round((loadAverage[0] / cores) * 100)
+          )
+        : 0;
+
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
+
+    const memUsagePercent =
+      totalMem > 0
+        ? Math.round((usedMem / totalMem) * 100)
+        : 0;
+
+    // --------------------------------------------------------
+    // NETWORK INTERFACES
+    // --------------------------------------------------------
+
+    const ifaces = os.networkInterfaces();
+
+    const interfacesList: SystemHealth["interfaces"] = [];
+
+    for (const [name, addrs] of Object.entries(ifaces)) {
+      if (!addrs) continue;
+
+      for (const addr of addrs) {
+        interfacesList.push({
+          name,
+          ip: addr.address,
+          mac: addr.mac,
+          netmask: addr.netmask,
+          family: addr.family,
+          internal: addr.internal,
+        });
+      }
+    }
+
+    // --------------------------------------------------------
+    // SYSTEM COMMANDS
+    // --------------------------------------------------------
+
+    const [osReleaseRes, diskRes, socketsRes] =
+      await Promise.all([
+        runShellCommand(
+          "cat /etc/os-release 2>/dev/null || uname -a"
+        ),
+        runShellCommand(
+          "df -h / 2>/dev/null || df -h"
+        ),
+        runShellCommand(
+          "ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null || lsof -i -P -n 2>/dev/null"
+        ),
+      ]);
+
+    // --------------------------------------------------------
+    // OS PARSING
+    // --------------------------------------------------------
+
+    let distroName:string = platform;
+
+    const prettyNameMatch =
+      osReleaseRes.stdout.match(
+        /PRETTY_NAME="([^"]+)"/
+      );
+
+    if (prettyNameMatch) {
+      distroName = prettyNameMatch[1];
+    } else if (
+      osReleaseRes.stdout
+        .toLowerCase()
+        .includes("kali")
+    ) {
+      distroName = "Kali GNU/Linux";
+    }
+
+    // --------------------------------------------------------
+    // DISK PARSING
+    // --------------------------------------------------------
+
+    const diskList: SystemHealth["disk"] = [];
+
+    const diskLines = diskRes.stdout
+      .trim()
+      .split("\n")
+      .slice(1);
+
+    for (const line of diskLines) {
+      const parts = line.trim().split(/\s+/);
+
+      if (parts.length >= 6) {
+        diskList.push({
+          filesystem: parts[0],
+          size: parts[1],
+          used: parts[2],
+          avail: parts[3],
+          usePercent: parts[4],
+          mountedOn: parts.slice(5).join(" "),
+        });
+      }
+    }
+
+    // --------------------------------------------------------
+    // SOCKET PARSING
+    // --------------------------------------------------------
+
+    const listeningSockets: SystemHealth["listeningSockets"] =
+      [];
+
+    const socketLines = socketsRes.stdout
+      .trim()
+      .split("\n")
+      .slice(1);
+
+    for (const line of socketLines) {
+      const parts = line.trim().split(/\s+/);
+
+      if (parts.length < 5) continue;
+
+      const proto = parts[0];
+      const state = parts[1];
+
+      const local =
+        parts[4] ||
+        parts[3] ||
+        "";
+
+      const peer =
+        parts[5] ||
+        parts[4] ||
+        "";
+
+      const lastColon = local.lastIndexOf(":");
+
+      let localAddress = local;
+      let localPort: number | string = "";
+
+      if (lastColon !== -1) {
+        localAddress = local.slice(0, lastColon);
+
+        const parsedPort = parseInt(
+          local.slice(lastColon + 1),
+          10
+        );
+
+        localPort =
+          Number.isNaN(parsedPort)
+            ? local.slice(lastColon + 1)
+            : parsedPort;
+      }
+
+      if (localPort) {
+        listeningSockets.push({
+          protocol: proto,
+          state,
+          localAddress: localAddress || "*",
+          localPort,
+          peerAddress: peer,
+        });
+      }
+    }
+
+    // --------------------------------------------------------
+    // SECURITY TOOLS
+    // --------------------------------------------------------
+
+    const toolsToCheck = [
+      {
+        name: "Python 3 Kernel Engine",
+        cmd: "python3 --version",
+      },
+      {
+        name: "Nmap Network Scanner",
+        cmd: "nmap --version",
+      },
+      {
+        name: "Ping Utility",
+        cmd: "ping -V 2>&1 || ping -c 1 127.0.0.1",
+      },
+      {
+        name: "Traceroute",
+        cmd: "traceroute --version 2>&1 || tracepath -V",
+      },
+      {
+        name: "cURL HTTP Client",
+        cmd: "curl --version",
+      },
+      {
+        name: "Socket Statistics",
+        cmd: "ss -V",
+      },
+      {
+        name: "Dig DNS Utility",
+        cmd: "dig -v 2>&1",
+      },
+      {
+        name: "Whois",
+        cmd: "whois --version 2>&1",
+      },
+      {
+        name: "UFW Firewall",
+        cmd: "ufw status verbose 2>&1 || ufw --version",
+      },
+      {
+        name: "IPtables",
+        cmd: "iptables --version 2>&1",
+      },
+      {
+        name: "TCPDump Packet Capture",
+        cmd: "tcpdump --version 2>&1",
+      },
+      {
+        name: "Nikto Web Scanner",
+        cmd: "nikto -Version 2>&1",
+      },
+      {
+        name: "Gobuster Directory Scanner",
+        cmd: "gobuster version 2>&1",
+      },
+    ];
+
+    const toolResults = await Promise.all(
+      toolsToCheck.map(async (tool) => {
+        const check = await runShellCommand(
+          tool.cmd,
+          1500
+        );
+
+        const available =
+          check.exitCode === 0 ||
+          check.stdout.trim().length > 0;
+
+        const output =
+          check.stdout ||
+          check.stderr ||
+          "";
+
+        const firstLine =
+          output.trim().split("\n")[0] || "";
+
+        return {
+          name: tool.name,
+          command: tool.cmd.split(" ")[0],
+          available,
+          version: available
+            ? firstLine.slice(0, 70)
+            : undefined,
+        };
+      })
+    );
+
+    const payload: SystemHealth = {
+      hostname,
+
+      osInfo: {
+        platform,
+        distro: distroName,
+        release,
+        kernel: release,
+        arch,
+      },
+
+      uptimeSeconds,
+      uptimeFormatted,
+
+      cpu: {
+        model: cpuModel,
+        cores,
+        usagePercent: cpuUsagePercent,
+        loadAverage,
+      },
+
+      memory: {
+        totalBytes: totalMem,
+        usedBytes: usedMem,
+        freeBytes: freeMem,
+        usedPercent: memUsagePercent,
+      },
+
+      disk: diskList,
+
+      interfaces: interfacesList,
+
+      listeningSockets:
+        listeningSockets.slice(0, 30),
+
+      toolsInstalled: toolResults,
+
+      timestamp: new Date().toISOString(),
+    };
+
+    res.json(payload);
+  } catch (err: any) {
+    res.status(500).json({
+      error:
+        err?.message ||
+        "Failed to retrieve system health",
+    });
+  }
+});
+
+// ============================================================
+// 2. PORT VULNERABILITY ENGINE
+// ============================================================
+
+function checkPortVulnerability(
+  ip: string,
+  port: number,
+  service: string,
+  vulnList: VulnerabilityFinding[]
+): void {
+  const now = new Date().toISOString();
+
+  if (port === 21) {
+    vulnList.push({
+      id: `vuln-ftp-${port}-${Date.now()}`,
+      title: "Unencrypted FTP Service Detected",
+      severity: "high",
+      category: "service",
+      target: ip,
+      port,
+      description:
+        `FTP service is active on port ${port}. ` +
+        "Standard FTP transmits authentication credentials and data in cleartext.",
+      impact:
+        "Network eavesdropping, credential sniffing, and unauthorized file access.",
+      cvssScore: 7.5,
+      remediationAdvice:
+        "Migrate to SFTP or FTPS. Disable plaintext anonymous access and enforce strong passwords.",
+      kaliCommands: [
+        "sudo systemctl stop vsftpd",
+        "sudo systemctl disable vsftpd",
+        "sudo ufw deny 21/tcp",
+        "# Configure TLS in /etc/vsftpd.conf if FTPS is required",
+      ],
+      detectedVia: "Kali Port Reconnaissance",
+      detectedAt: now,
+    });
+  } else if (port === 23) {
+    vulnList.push({
+      id: `vuln-telnet-${port}-${Date.now()}`,
+      title: "Cleartext Telnet Daemon Exposed",
+      severity: "critical",
+      category: "service",
+      target: ip,
+      port,
+      description:
+        "Telnet is listening on port 23. Telnet provides no encryption for authentication or session traffic.",
+      impact:
+        "Administrative credentials and sessions can potentially be captured by attackers on the same network.",
+      cvssScore: 9.8,
+      remediationAdvice:
+        "Disable Telnet and replace it with OpenSSH. Block TCP port 23 at host and network firewalls.",
+      kaliCommands: [
+        "sudo systemctl stop telnet.socket telnetd 2>/dev/null || true",
+        "sudo systemctl disable telnet.socket telnetd 2>/dev/null || true",
+        "sudo ufw deny 23/tcp",
+        "sudo apt-get install -y openssh-server",
+      ],
+      detectedVia: "Kali Port Reconnaissance",
+      detectedAt: now,
+    });
+  } else if (port === 3306) {
+    vulnList.push({
+      id: `vuln-mysql-${port}-${Date.now()}`,
+      title: "Exposed MySQL Database Port",
+      severity: "medium",
+      category: "network",
+      target: ip,
+      port,
+      description:
+        "MySQL/MariaDB is reachable over TCP port 3306.",
+      impact:
+        "Potential brute-force attacks against database accounts or unauthorized database access if authentication is weak.",
+      cvssScore: 6.5,
+      remediationAdvice:
+        "Bind MySQL/MariaDB to localhost when remote access is unnecessary and restrict access with a firewall.",
+      kaliCommands: [
+        "sudo ufw deny 3306/tcp",
+        "sudo systemctl restart mariadb 2>/dev/null || sudo systemctl restart mysql",
+      ],
+      detectedVia: "Kali Port Reconnaissance",
+      detectedAt: now,
+    });
+  } else if (port === 6379) {
+    vulnList.push({
+      id: `vuln-redis-${port}-${Date.now()}`,
+      title: "Potentially Exposed Redis Instance",
+      severity: "critical",
+      category: "service",
+      target: ip,
+      port,
+      description:
+        "Redis is listening on port 6379. An externally reachable Redis service should be authenticated and network-restricted.",
+      impact:
+        "Unauthorized access to Redis data and, depending on configuration, possible host compromise.",
+      cvssScore: 9.8,
+      remediationAdvice:
+        "Bind Redis to localhost or a trusted interface, enable authentication/ACLs, enable protected mode, and restrict port 6379 with a firewall.",
+      kaliCommands: [
+        "sudo ufw deny 6379/tcp",
+        "sudo systemctl restart redis 2>/dev/null || sudo systemctl restart redis-server",
+      ],
+      detectedVia: "Kali Port Reconnaissance",
+      detectedAt: now,
+    });
+  } else if (port === 80) {
+    vulnList.push({
+      id: `vuln-http-${port}-${Date.now()}`,
+      title: "Unencrypted HTTP Service Detected",
+      severity: "low",
+      category: "web",
+      target: ip,
+      port,
+      description:
+        "A web server is listening on port 80 using cleartext HTTP.",
+      impact:
+        "Unencrypted traffic may expose session cookies, credentials, or other sensitive information.",
+      cvssScore: 4.3,
+      remediationAdvice:
+        "Configure HTTPS and redirect HTTP traffic to HTTPS. Enable HSTS on the HTTPS endpoint.",
+      kaliCommands: [
+        "sudo apt-get install -y certbot python3-certbot-nginx",
+        "# Configure an HTTP-to-HTTPS redirect on the web server",
+      ],
+      detectedVia: "Kali Port Reconnaissance",
+      detectedAt: now,
+    });
+  } else if (port === 445) {
+    vulnList.push({
+      id: `vuln-smb-${port}-${Date.now()}`,
+      title: "SMB Service Exposed",
+      severity: "medium",
+      category: "network",
+      target: ip,
+      port,
+      description:
+        "SMB is reachable on TCP port 445.",
+      impact:
+        "Exposed SMB can increase the attack surface for credential attacks, information disclosure, and known SMB vulnerabilities.",
+      cvssScore: 6.5,
+      remediationAdvice:
+        "Restrict SMB to trusted networks and hosts. Disable SMBv1 and keep Samba/Windows security patches current.",
+      kaliCommands: [
+        "sudo ufw deny 445/tcp",
+        "sudo ufw deny 139/tcp",
+      ],
+      detectedVia: "Kali Port Reconnaissance",
+      detectedAt: now,
+    });
+  } else if (port === 3389) {
+    vulnList.push({
+      id: `vuln-rdp-${port}-${Date.now()}`,
+      title: "Remote Desktop Service Exposed",
+      severity: "medium",
+      category: "network",
+      target: ip,
+      port,
+      description:
+        "Remote Desktop Protocol is reachable on TCP port 3389.",
+      impact:
+        "Internet or untrusted-network exposure can increase the risk of password attacks and RDP exploitation.",
+      cvssScore: 6.5,
+      remediationAdvice:
+        "Restrict RDP access to trusted networks or VPNs, enforce strong authentication, and keep the system patched.",
+      kaliCommands: [
+        "sudo ufw deny 3389/tcp",
+      ],
+      detectedVia: "Kali Port Reconnaissance",
+      detectedAt: now,
+    });
+  }
+
+  void service;
+}
+
+// ============================================================
+// 3. NETWORK & PORT SCANNING
+// ============================================================
+
+app.post("/api/scan/network", async (req, res) => {
+  const target = String(
+    req.body?.target || "127.0.0.1"
+  ).trim();
+
+  const scanType = String(
+    req.body?.scanType || "quick"
+  );
+
+  const rawCustomPorts = Array.isArray(req.body?.ports)
+    ? req.body.ports
+    : [];
+
+  const customPorts: number[] = rawCustomPorts
+    .map((p: unknown) => Number(p))
+    .filter(isValidPort);
+
+  const startTime = Date.now();
+
+  let rawTerminalOutput = "";
+
+  const discoveredHosts: DiscoveredHost[] = [];
+
+  const vulnerabilities: VulnerabilityFinding[] = [];
+
+  try {
+    if (!target) {
+      return res.status(400).json({
+        error: "No scan target supplied.",
+      });
+    }
+
+    const isRange =
+      target.includes("/") ||
+      target.includes("-") ||
+      target.includes(",");
+
+    // --------------------------------------------------------
+    // CHECK NMAP
+    // --------------------------------------------------------
+
+    const nmapCheck = await runShellCommand(
+      "command -v nmap",
+      1000
+    );
+
+    const hasNmap =
+      nmapCheck.exitCode === 0 &&
+      nmapCheck.stdout.trim().length > 0;
+
+    // --------------------------------------------------------
+    // NMAP SCAN
+    // --------------------------------------------------------
+
+    if (hasNmap) {
+      let nmapArgs = "-T4 -F";
+
+      if (scanType === "full") {
+        nmapArgs =
+          "-T4 -sV --top-ports 200";
+      } else if (scanType === "ping-sweep") {
+        nmapArgs = "-sn";
+      } else if (customPorts.length > 0) {
+        nmapArgs =
+          `-T4 -p ${customPorts.join(",")}`;
+      }
+
+      const sanitizedTarget =
+        sanitizeScanTarget(target);
+
+      const nmapCommand =
+        `nmap ${nmapArgs} ${sanitizedTarget}`;
+
+      rawTerminalOutput +=
+        `$ ${nmapCommand}\n`;
+
+      const nmapRun =
+        await runShellCommand(
+          nmapCommand,
+          25000
+        );
+
+      rawTerminalOutput +=
+        nmapRun.stdout ||
+        nmapRun.stderr ||
+        "";
+
+      // ------------------------------------------------------
+      // PARSE NMAP OUTPUT
+      // ------------------------------------------------------
+
+      const hostBlocks =
+        nmapRun.stdout.split(
+          "Nmap scan report for "
+        );
+
+      for (const block of hostBlocks) {
+        if (!block.trim()) continue;
+
+        const lines =
+          block.split("\n");
+
+        const firstLine =
+          lines[0]?.trim() || "";
+
+        const ipMatch =
+          firstLine.match(
+            /(\d{1,3}(?:\.\d{1,3}){3})/
+          );
+
+        const hostIp =
+          ipMatch?.[1] ||
+          firstLine.split(" ")[0];
+
+        if (!hostIp) continue;
+
+        const isUp =
+          /Host is up/i.test(block) ||
+          /Host is up/i.test(
+            lines.join("\n")
+          );
+
+        const openPorts: DiscoveredPort[] =
+          [];
+
+        for (const line of lines) {
+          const portMatch =
+            line.match(
+              /^\s*(\d+)\/(tcp|udp)\s+(\S+)\s+(.+?)\s*$/
+            );
+
+          if (!portMatch) continue;
+
+          const portNum =
+            parseInt(portMatch[1], 10);
+
+          const protocol =
+            portMatch[2] as "tcp" | "udp";
+
+          const state =
+            portMatch[3];
+
+          const service =
+            portMatch[4].trim();
+
+          if (
+            state === "open" &&
+            isValidPort(portNum)
+          ) {
+            openPorts.push({
+              port: portNum,
+              protocol,
+              service,
+              state: "open",
+            });
+
+            checkPortVulnerability(
+              hostIp,
+              portNum,
+              service,
+              vulnerabilities
+            );
+          }
+        }
+          
+             if (
+          isUp ||
+          openPorts.length > 0
+        ) {
+          const localTelemetry =
+            hostIp === "127.0.0.1"
+              ? await collectLocalHostTelemetry()
+              : {};
+
+          discoveredHosts.push({
+            ip: hostIp,
+            status: "up",
+            lastSeen:
+              new Date().toISOString(),
+            openPorts,
+            ...localTelemetry,
+          });
+        }
+      }
+    } 
+
+
+    // --------------------------------------------------------
+    // NATIVE SOCKET FALLBACK
+    // --------------------------------------------------------
+
+    if (discoveredHosts.length === 0) {
+      if (isRange) {
+        const ipsToScan: string[] = [];
+
+        // ----------------------------------------------------
+        // CIDR
+        // ----------------------------------------------------
+
+        if (target.includes("/")) {
+          const [baseIp, prefixText] =
+            target.split("/");
+
+          const prefix =
+            parseInt(prefixText, 10);
+
+          if (
+            /^\d{1,3}(?:\.\d{1,3}){3}$/.test(
+              baseIp
+            ) &&
+            prefix >= 24 &&
+            prefix <= 32
+          ) {
+            const octets =
+              baseIp
+                .split(".")
+                .map(Number);
+
+            const base =
+              (octets[0] << 24) |
+              (octets[1] << 16) |
+              (octets[2] << 8) |
+              octets[3];
+
+            const hostCount =
+              Math.min(
+                256,
+                2 ** (32 - prefix)
+              );
+
+            for (
+              let i = 0;
+              i < hostCount;
+              i++
+            ) {
+              const value =
+                (base >>> 0) + i;
+
+              const ip =
+                `${(value >>> 24) & 255}.` +
+                `${(value >>> 16) & 255}.` +
+                `${(value >>> 8) & 255}.` +
+                `${value & 255}`;
+
+              ipsToScan.push(ip);
+            }
+          } else {
+            ipsToScan.push(baseIp);
+          }
+        }
+
+        // ----------------------------------------------------
+        // DASH RANGE
+        // ----------------------------------------------------
+
+        else if (target.includes("-")) {
+          const parts =
+            target.split("-");
+
+          const base =
+            parts[0].trim();
+
+          const endNum =
+            parseInt(
+              parts[1]?.trim() || "",
+              10
+            );
+
+          const lastDot =
+            base.lastIndexOf(".");
+
+          const startNum =
+            parseInt(
+              base.slice(lastDot + 1),
+              10
+            );
+
+          const prefix =
+            base.slice(0, lastDot + 1);
+
+          if (
+            !Number.isNaN(startNum) &&
+            !Number.isNaN(endNum)
+          ) {
+            for (
+              let i = startNum;
+              i <= Math.min(
+                endNum,
+                startNum + 20
+              );
+              i++
+            ) {
+              ipsToScan.push(
+                `${prefix}${i}`
+              );
+            }
+          }
+        }
+
+        // ----------------------------------------------------
+        // COMMA-SEPARATED TARGETS
+        // ----------------------------------------------------
+
+        else if (target.includes(",")) {
+          ipsToScan.push(
+            ...target
+              .split(",")
+              .map((ip: string) =>
+                ip.trim()
+              )
+              .filter(Boolean)
+          );
+        }
+
+        if (ipsToScan.length === 0) {
+          ipsToScan.push(target);
+        }
+
+        rawTerminalOutput +=
+          `$ [Native Socket Probe] Sweeping ${ipsToScan.length} target(s)\n`;
+
+        const portsToCheck =
+          customPorts.length > 0
+            ? customPorts.map((port) => ({
+                port,
+                service: `port-${port}`,
+                protocol:
+                  "tcp" as const,
+              }))
+            : COMMON_PORTS.slice(
+                0,
+                10
+              );
+
+        await Promise.all(
+          ipsToScan.map(
+            async (ip) => {
+              const openPorts: DiscoveredPort[] =
+                [];
+
+              for (
+                const p of portsToCheck
+              ) {
+                const result =
+                  await probeTcpPort(
+                    ip,
+                    p.port,
+                    400
+                  );
+
+                if (result.open) {
+                  openPorts.push({
+                    port: p.port,
+                    protocol:
+                      p.protocol,
+                    service:
+                      p.service,
+                    state: "open",
+                    banner:
+                      result.banner,
+                  });
+
+                  checkPortVulnerability(
+                    ip,
+                    p.port,
+                    p.service,
+                    vulnerabilities
+                  );
+                }
+              }
+
+              if (
+                openPorts.length > 0 ||
+                ip === "127.0.0.1" ||
+                ip === "localhost"
+              ) {
+                discoveredHosts.push({
+                  ip,
+                  status: "up",
+                  lastSeen:
+                    new Date().toISOString(),
+                  openPorts,
+                });
+              }
+            }
+          )
+        );
+      } else {
+        // ------------------------------------------------------
+        // SINGLE TARGET SOCKET SCAN
+        // ------------------------------------------------------
+
+        rawTerminalOutput +=
+          `$ [Direct Socket Reconnaissance] Targeting ${target}\n`;
+
+        const portsToCheck =
+          customPorts.length > 0
+            ? customPorts.map((port) => ({
+                port,
+                service: `custom-${port}`,
+                protocol:
+                  "tcp" as const,
+              }))
+            : COMMON_PORTS;
+
+        const openPorts: DiscoveredPort[] =
+          [];
+
+        let hostLatency = 0;
+
+        for (
+          const p of portsToCheck
+        ) {
+          const result =
+            await probeTcpPort(
+              target,
+              p.port,
+              500
+            );
+
+          if (result.open) {
+            hostLatency =
+              result.latencyMs;
+
+            openPorts.push({
+              port: p.port,
+              protocol: p.protocol,
+              service: p.service,
+              state: "open",
+              banner:
+                result.banner,
+            });
+
+            rawTerminalOutput +=
+              `[+] Port ${p.port}/tcp OPEN ` +
+              `(${p.service})` +
+              `${
+                result.banner
+                  ? ` Banner: ${result.banner}`
+                  : ""
+              }\n`;
+
+            checkPortVulnerability(
+              target,
+              p.port,
+              p.service,
+              vulnerabilities
+            );
+          }
+        }
+
+        discoveredHosts.push({
+          ip: target,
+          status:
+            openPorts.length > 0
+              ? "up"
+              : "unfiltered",
+          latencyMs: hostLatency,
+          lastSeen:
+            new Date().toISOString(),
+          openPorts,
+        });
+      }
+    }
+
+    const durationMs =
+      Date.now() - startTime;
+
+    const totalOpenPorts =
+      discoveredHosts.reduce(
+        (total, host) =>
+          total + host.openPorts.length,
+        0
+      );
+
+    rawTerminalOutput +=
+      `\n[✓] Scan completed in ${durationMs}ms. ` +
+      `Found ${discoveredHosts.length} host(s) ` +
+      `and ${totalOpenPorts} open port(s).\n`;
+
+    const record: ScanRunRecord = {
+      id: `scan-${Date.now()}`,
+      timestamp:
+        new Date().toISOString(),
+
+      type: isContinuousScanActive
+        ? "quick-5s"
+        : "network",
+
+      target,
+
+      commandExecuted: hasNmap
+        ? `nmap ${scanType === "full" ? "-T4 -sV --top-ports 200" : "-T4 -F"} ${target}`
+        : `socket-probe --ports standard ${target}`,
+
+      durationMs,
+      status: "success",
+
+      hostsFound:
+        discoveredHosts.length,
+
+      openPortsTotal:
+        totalOpenPorts,
+
+      vulnerabilitiesCount:
+        countVulnerabilities(
+          vulnerabilities
+        ),
+
+      rawTerminalOutput,
+
+      results: {
+        hosts:
+          discoveredHosts,
+        vulnerabilities,
+      },
+    };
+
+    addScanHistory(record);
+
+    return res.json({
+      record,
+      hosts:
+        discoveredHosts,
+      vulnerabilities,
+      rawOutput:
+        rawTerminalOutput,
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      error:
+        err?.message ||
+        "Network scan failed",
+    });
+  }
+});
+
+// ============================================================
+// 4. WEBSITE SECURITY AUDITOR
+// ============================================================
+
+app.post("/api/scan/website", async (req, res) => {
+  let targetUrl = String(
+    req.body?.url || ""
+  ).trim();
+
+  if (!targetUrl) {
+    return res.status(400).json({
+      error: "No website URL supplied.",
+    });
+  }
+
+  if (
+    !targetUrl.startsWith("http://") &&
+    !targetUrl.startsWith("https://")
+  ) {
+    targetUrl =
+      `https://${targetUrl}`;
+  }
+
+  const startTime = Date.now();
+
+  try {
+    const parsedUrl =
+      new URL(targetUrl);
+
+    if (
+      !["http:", "https:"].includes(
+        parsedUrl.protocol
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          "Only HTTP and HTTPS URLs are supported.",
+      });
+    }
+
+    const isHttps =
+      parsedUrl.protocol === "https:";
+
+    const port =
+      parsedUrl.port
+        ? parseInt(
+            parsedUrl.port,
+            10
+          )
+        : isHttps
+        ? 443
+        : 80;
+
+    let sslInfo:
+      WebAuditResult["ssl"] =
+      undefined;
+
+    // --------------------------------------------------------
+    // SSL INSPECTION
+    // --------------------------------------------------------
+
+    if (isHttps) {
+      await new Promise<void>(
+        (resolve) => {
+          const socket =
+            tls.connect({
+              host:
+                parsedUrl.hostname,
+              port,
+              servername:
+                parsedUrl.hostname,
+              rejectUnauthorized:
+                false,
+              timeout: 4000,
+            });
+
+          socket.on(
+            "secureConnect",
+            () => {
+              try {
+                const cert =
+                  socket.getPeerCertificate();
+
+                if (
+                  cert &&
+                  cert.valid_to
+                ) {
+                  const validToDate =
+                    new Date(
+                      cert.valid_to
+                    );
+
+                  const daysRemaining =
+                    Math.round(
+                      (validToDate.getTime() -
+                        Date.now()) /
+                        (1000 *
+                          60 *
+                          60 *
+                          24)
+                    );
+
+                  let issuerStr =
+                    "Unknown";
+
+                  if (cert.issuer) {
+                    if (
+                      typeof cert.issuer ===
+                      "object"
+                    ) {
+                      const issuer =
+                        cert.issuer as {
+                          O?: string | string[];
+                          CN?: string | string[];
+                        };
+
+                      const org =
+                        Array.isArray(
+                          issuer.O
+                        )
+                          ? issuer.O[0]
+                          : issuer.O;
+
+                      const cn =
+                        Array.isArray(
+                          issuer.CN
+                        )
+                          ? issuer.CN[0]
+                          : issuer.CN;
+
+                      issuerStr =
+                        org ||
+                        cn ||
+                        "Unknown";
+                    } else {
+                      issuerStr =
+                        String(
+                          cert.issuer
+                        );
+                    }
+                  }
+
+                  sslInfo = {
+                    valid:
+                      socket.authorized,
+                    issuer:
+                      issuerStr,
+                    validTo:
+                      cert.valid_to,
+                    daysRemaining,
+                    protocol:
+                      socket.getProtocol() ||
+                      "TLS",
+                  };
+                }
+              } finally {
+                socket.destroy();
+                resolve();
+              }
+            }
+          );
+
+          socket.on(
+            "error",
+            () => {
+              socket.destroy();
+              resolve();
+            }
+          );
+
+          socket.on(
+            "timeout",
+            () => {
+              socket.destroy();
+              resolve();
+            }
+          );
+        }
+      );
+    }
+
+    // --------------------------------------------------------
+    // HTTP HEADERS
+    // --------------------------------------------------------
+
+    const curlTarget =
+      targetUrl.replace(
+        /"/g,
+        "%22"
+      );
+
+    const curlRun =
+      await runShellCommand(
+        `curl -I -s -L --max-time 6 "${curlTarget}"`,
+        7000
+      );
+
+    const responseTimeMs =
+      Date.now() - startTime;
+
+    const headers: Record<
+      string,
+      string
+    > = {};
+
+    let statusCode = 200;
+    let statusText = "OK";
+
+    const headerLines =
+      curlRun.stdout.split("\n");
+
+    for (
+      const rawLine of headerLines
+    ) {
+      const line =
+        rawLine.trim();
+
+      if (
+        line.startsWith("HTTP/")
+      ) {
+        const parts =
+          line.split(/\s+/);
+
+        const parsedStatus =
+          parseInt(
+            parts[1] || "",
+            10
+          );
+
+        if (!Number.isNaN(
+          parsedStatus
+        )) {
+          statusCode =
+            parsedStatus;
+        }
+
+        statusText =
+          parts
+            .slice(2)
+            .join(" ") ||
+          "OK";
+      } else {
+        const colon =
+          line.indexOf(":");
+
+        if (colon !== -1) {
+          const key =
+            line
+              .slice(0, colon)
+              .trim()
+              .toLowerCase();
+
+          const value =
+            line
+              .slice(colon + 1)
+              .trim();
+
+          if (key) {
+            headers[key] =
+              value;
+          }
+        }
+      }
+    }
+
+    // --------------------------------------------------------
+    // SECURITY HEADER CHECKS
+    // --------------------------------------------------------
+
+    const securityHeaderChecks = [
+      {
+        name:
+          "Strict-Transport-Security (HSTS)",
+        headerKey:
+          "strict-transport-security",
+        recommendation:
+          "Add Strict-Transport-Security with an appropriate max-age to prevent SSL-stripping attacks.",
+        severity:
+          "high" as const,
+      },
+
+      {
+        name:
+          "Content-Security-Policy (CSP)",
+        headerKey:
+          "content-security-policy",
+        recommendation:
+          "Implement CSP to restrict executable scripts, styles, frames, and other resource origins.",
+        severity:
+          "high" as const,
+      },
+
+      {
+        name:
+          "X-Frame-Options",
+        headerKey:
+          "x-frame-options",
+        recommendation:
+          "Set X-Frame-Options to DENY or SAMEORIGIN to reduce clickjacking risk.",
+        severity:
+          "medium" as const,
+      },
+
+      {
+        name:
+          "X-Content-Type-Options",
+        headerKey:
+          "x-content-type-options",
+        recommendation:
+          "Set X-Content-Type-Options: nosniff to reduce MIME-sniffing attacks.",
+        severity:
+          "low" as const,
+      },
+
+      {
+        name:
+          "Referrer-Policy",
+        headerKey:
+          "referrer-policy",
+        recommendation:
+          "Set a restrictive Referrer-Policy such as strict-origin-when-cross-origin.",
+        severity:
+          "low" as const,
+      },
+
+      {
+        name:
+          "Permissions-Policy",
+        headerKey:
+          "permissions-policy",
+        recommendation:
+          "Restrict browser capabilities such as camera, microphone, and geolocation.",
+        severity:
+          "low" as const,
+      },
+    ];
+
+    let passedHeaders = 0;
+
+    const evaluatedHeaders =
+      securityHeaderChecks.map(
+        (check) => {
+          const present =
+            Boolean(
+              headers[
+                check.headerKey
+              ]
+            );
+
+          if (present) {
+            passedHeaders++;
+          }
+
+          return {
+            name:
+              check.name,
+
+            present,
+
+            value:
+              headers[
+                check.headerKey
+              ],
+
+            recommendation:
+              check.recommendation,
+
+            severity: present
+              ? ("pass" as const)
+              : check.severity,
+          };
+        }
+      );
+
+    // --------------------------------------------------------
+    // SECURITY SCORE
+    // --------------------------------------------------------
+
+    let score = Math.round(
+      (passedHeaders /
+        securityHeaderChecks.length) *
+        100
+    );
+
+    if (!isHttps) {
+      score = Math.max(
+        0,
+        score - 30
+      );
+    }
+
+    if (headers["server"]) {
+      score = Math.max(
+        0,
+        score - 5
+      );
+    }
+
+    if (
+      headers["x-powered-by"]
+    ) {
+      score = Math.max(
+        0,
+        score - 5
+      );
+    }
+
+    let grade:
+      WebAuditResult["securityGrade"] =
+      "F";
+
+    if (score >= 90) {
+      grade = "A+";
+    } else if (score >= 80) {
+      grade = "A";
+    } else if (score >= 65) {
+      grade = "B";
+    } else if (score >= 50) {
+      grade = "C";
+    } else if (score >= 35) {
+      grade = "D";
+    }
+
+    // --------------------------------------------------------
+    // WEB VULNERABILITIES
+    // --------------------------------------------------------
+
+    const webVulns:
+      VulnerabilityFinding[] =
+      [];
+
+    const detectedAt =
+      new Date().toISOString();
+
+    // HSTS
+
+    if (
+      !headers[
+        "strict-transport-security"
+      ] &&
+      isHttps
+    ) {
+      webVulns.push({
+        id:
+          `vuln-hsts-${Date.now()}`,
+
+        title:
+          "Missing HTTP Strict Transport Security (HSTS)",
+
+        severity:
+          "high",
+
+        category:
+          "web",
+
+        target:
+          targetUrl,
+
+        description:
+          "The HTTPS website does not return the Strict-Transport-Security header.",
+
+        impact:
+          "Increases exposure to downgrade and SSL-stripping attacks.",
+
+        cvssScore:
+          7.4,
+
+        remediationAdvice:
+          "Configure the HTTPS web server to return an appropriate Strict-Transport-Security header.",
+
+        kaliCommands: [
+          "# Example Nginx configuration:",
+          'add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;',
+          "sudo nginx -t && sudo systemctl reload nginx",
+        ],
+
+        detectedVia:
+          "Web Header Auditor",
+
+        detectedAt,
+      });
+    }
+
+    // HTTP
+
+    if (!isHttps) {
+      webVulns.push({
+        id:
+          `vuln-http-cleartext-${Date.now()}`,
+
+        title:
+          "Unencrypted HTTP Connection",
+
+        severity:
+          "high",
+
+        category:
+          "web",
+
+        target:
+          targetUrl,
+
+        description:
+          "The target website is accessible over unencrypted HTTP.",
+
+        impact:
+          "HTTP traffic can potentially be intercepted or modified by attackers on the network.",
+
+        cvssScore:
+          7.4,
+
+        remediationAdvice:
+          "Configure HTTPS and redirect HTTP traffic to the HTTPS endpoint.",
+
+        kaliCommands: [
+          "# Nginx example:",
+          "return 301 https://$host$request_uri;",
+          "sudo nginx -t && sudo systemctl reload nginx",
+        ],
+
+        detectedVia:
+          "Web Header Auditor",
+
+        detectedAt,
+      });
+    }
+
+    // CSP
+
+    if (
+      !headers[
+        "content-security-policy"
+      ]
+    ) {
+      webVulns.push({
+        id:
+          `vuln-csp-${Date.now()}`,
+
+        title:
+          "Missing Content Security Policy (CSP)",
+
+        severity:
+          "high",
+
+        category:
+          "web",
+
+        target:
+          targetUrl,
+
+        description:
+          "The server does not return a Content-Security-Policy header.",
+
+        impact:
+          "A missing CSP removes an important browser-side defense against XSS and malicious resource injection.",
+
+        cvssScore:
+          7.2,
+
+        remediationAdvice:
+          "Define a restrictive Content-Security-Policy appropriate for the application.",
+
+        kaliCommands: [
+          "# Nginx example:",
+          `add_header Content-Security-Policy "default-src 'self'; script-src 'self'; object-src 'none';" always;`,
+          "sudo nginx -t && sudo systemctl reload nginx",
+        ],
+
+        detectedVia:
+          "Web Header Auditor",
+
+        detectedAt,
+      });
+    }
+
+    // Server banner
+
+    if (
+      headers["server"] ||
+      headers["x-powered-by"]
+    ) {
+      const banner =
+        [
+          headers["server"],
+          headers["x-powered-by"],
+        ]
+          .filter(Boolean)
+          .join(" | ");
+
+      webVulns.push({
+        id:
+          `vuln-banner-${Date.now()}`,
+
+        title:
+          "Web Server Technology Disclosure",
+
+        severity:
+          "low",
+
+        category:
+          "configuration",
+
+        target:
+          targetUrl,
+
+        description:
+          `The server exposes technology information through HTTP headers: "${banner}".`,
+
+        impact:
+          "Technology disclosure can help attackers identify software and target known vulnerabilities.",
+
+        cvssScore:
+          3.1,
+
+        remediationAdvice:
+          "Disable unnecessary server and framework version disclosure.",
+
+        kaliCommands: [
+          "# Nginx:",
+          "server_tokens off;",
+          "# Apache:",
+          "ServerTokens Prod",
+          "ServerSignature Off",
+        ],
+
+        detectedVia:
+          "Web Header Auditor",
+
+        detectedAt,
+      });
+    }
+
+    // --------------------------------------------------------
+    // AUDIT RESULT
+    // --------------------------------------------------------
+
+    const auditResult:
+      WebAuditResult = {
+        url:
+          targetUrl,
+
+        resolvedIp:
+          parsedUrl.hostname,
+
+        statusCode,
+        statusText,
+
+        responseTimeMs,
+
+        protocol:
+          isHttps
+            ? sslInfo?.protocol ||
+              "HTTPS/TLS"
+            : "HTTP (Cleartext)",
+
+        securityScore:
+          score,
+
+        securityGrade:
+          grade,
+
+        ssl:
+          sslInfo,
+
+        headers,
+
+        securityHeaders:
+          evaluatedHeaders,
+
+        vulnerabilities:
+          webVulns,
+
+        timestamp:
+          new Date().toISOString(),
+
+        rawOutput:
+          curlRun.stdout,
+      };
+
+    // --------------------------------------------------------
+    // HISTORY
+    // --------------------------------------------------------
+
+    addScanHistory({
+      id:
+        `web-scan-${Date.now()}`,
+
+      timestamp:
+        new Date().toISOString(),
+
+      type:
+        "web",
+
+      target:
+        targetUrl,
+
+      commandExecuted:
+        `curl -I -s -L "${targetUrl}"`,
+
+      durationMs:
+        responseTimeMs,
+
+      status:
+        "success",
+
+      hostsFound:
+        1,
+
+      openPortsTotal:
+        1,
+
+      vulnerabilitiesCount:
+        countVulnerabilities(
+          webVulns
+        ),
+
+      rawTerminalOutput:
+        curlRun.stdout,
+
+      results: {
+        webAudit:
+          auditResult,
+
+        vulnerabilities:
+          webVulns,
+      },
+    });
+
+    return res.json(
+      auditResult
+    );
+  } catch (err: any) {
+    return res.status(500).json({
+      error:
+        err?.message ||
+        "Web audit failed",
+    });
+  }
+});
+
+// ============================================================
+// 5. CONTINUOUS MONITORING
+// ============================================================
+
+app.get(
+  "/api/interval/status",
+  (_req, res) => {
+    res.json({
+      active:
+        isContinuousScanActive,
+
+      intervalSeconds:
+        continuousScanIntervalSeconds,
+
+      target:
+        continuousScanTarget,
+
+      recentScansCount:
+        scanHistory.length,
+    });
+  }
+);
+
+app.post(
+  "/api/interval/toggle",
+  (req, res) => {
+    const {
+      active,
+      intervalSeconds,
+      target,
+    } = req.body || {};
+
+    if (
+      typeof intervalSeconds ===
+        "number" &&
+      Number.isFinite(
+        intervalSeconds
+      ) &&
+      intervalSeconds >= 3
+    ) {
+      continuousScanIntervalSeconds =
+        Math.floor(
+          intervalSeconds
+        );
+    }
+
+    if (
+      typeof target === "string" &&
+      target.trim()
+    ) {
+      continuousScanTarget =
+        target.trim();
+    }
+
+    isContinuousScanActive =
+      Boolean(active);
+
+    if (continuousIntervalTimer) {
+      clearInterval(
+        continuousIntervalTimer
+      );
+
+      continuousIntervalTimer =
+        null;
+    }
+
+    if (
+      isContinuousScanActive
+    ) {
+      void runContinuousScanTick();
+
+      continuousIntervalTimer =
+        setInterval(
+          () => {
+            void runContinuousScanTick();
+          },
+          continuousScanIntervalSeconds *
+            1000
+        );
+    }
+
+    res.json({
+      success:
+        true,
+
+      active:
+        isContinuousScanActive,
+
+      intervalSeconds:
+        continuousScanIntervalSeconds,
+
+      target:
+        continuousScanTarget,
+    });
+  }
+);
+
+// ------------------------------------------------------------
+// CONTINUOUS SCAN TICK
+// ------------------------------------------------------------
+
+async function runContinuousScanTick() {
+  try {
+    const startTime =
+      Date.now();
+
+    const probeTarget =
+      continuousScanTarget ||
+      "127.0.0.1";
+
+    const quickPorts = [
+      21,
+      22,
+      23,
+      80,
+      443,
+      3000,
+      3306,
+      6379,
+      8080,
+    ];
+
+    const openPorts:
+      DiscoveredPort[] = [];
+
+    const vulns:
+      VulnerabilityFinding[] = [];
+
+    for (
+      const port of quickPorts
+    ) {
+      const result =
+        await probeTcpPort(
+          probeTarget,
+          port,
+          350
+        );
+
+      if (!result.open) {
+        continue;
+      }
+
+      const service =
+        COMMON_PORTS.find(
+          (item) =>
+            item.port === port
+        )?.service ||
+        `port-${port}`;
+
+      openPorts.push({
+        port,
+        protocol:
+          "tcp",
+        service,
+        state:
+          "open",
+        banner:
+          result.banner,
+      });
+
+      checkPortVulnerability(
+        probeTarget,
+        port,
+        service,
+        vulns
+      );
+    }
+
+    const durationMs =
+      Date.now() - startTime;
+
+    const timestamp =
+      new Date().toISOString();
+
+    const record:
+      ScanRunRecord = {
+        id:
+          `tick-${Date.now()}`,
+
+        timestamp,
+
+        type:
+          "quick-5s",
+
+        target:
+          probeTarget,
+
+        commandExecuted:
+          `quick-interval-probe --ports 21,22,23,80,443,3000,3306,6379,8080 ${probeTarget}`,
+
+        durationMs,
+
+        status:
+          "success",
+
+        hostsFound:
+          1,
+
+        openPortsTotal:
+          openPorts.length,
+
+        vulnerabilitiesCount:
+          countVulnerabilities(
+            vulns
+          ),
+
+        rawTerminalOutput:
+          `[${new Date().toLocaleTimeString()}] ` +
+          `Interval scan on ${probeTarget} -> ` +
+          `${openPorts.length} port(s) open ` +
+          `(${openPorts.map(
+            (p) => p.port
+          ).join(", ") || "none"}) ` +
+          `in ${durationMs}ms`,
+
+        results: {
+          hosts: [
+            {
+              ip:
+                probeTarget,
+
+              status:
+                "up",
+
+              lastSeen:
+                timestamp,
+
+              openPorts,
+            },
+          ],
+
+          vulnerabilities:
+            vulns,
+        },
+      };
+
+    addScanHistory(record);
+  } catch (error) {
+    console.error(
+      "Continuous scan error:",
+      error
+    );
+  }
+}
+
+// ============================================================
+// 6. SCAN HISTORY
+// ============================================================
+
+app.get(
+  "/api/scan/history",
+  (_req, res) => {
+    res.json(
+      scanHistory
+    );
+  }
+);
+
+app.delete(
+  "/api/scan/history",
+  (_req, res) => {
+    scanHistory.length = 0;
+
+    res.json({
+      success:
+        true,
+
+      message:
+        "Scan history cleared",
+    });
+  }
+);
+
+// ============================================================
+// 7. INTERACTIVE KALI TERMINAL
+// ============================================================
+
+app.post(
+  "/api/terminal/exec",
+  async (req, res) => {
+    const {
+      command,
+      target,
+    } = req.body || {};
+
+    if (
+      !command ||
+      typeof command !==
+        "string"
+    ) {
+      return res.status(400).json({
+        error:
+          "No command specified",
+      });
+    }
+
+    const ALLOWED_COMMANDS =
+      [
+        "ping",
+        "traceroute",
+        "tracepath",
+        "nmap",
+        "curl",
+        "ss",
+        "netstat",
+        "ip",
+        "ifconfig",
+        "arp",
+        "dig",
+        "whois",
+        "nslookup",
+        "uname",
+        "uptime",
+        "df",
+        "free",
+        "cat",
+        "lsof",
+        "ufw",
+        "iptables",
+        "ps",
+        "top",
+        "ls",
+        "head",
+        "grep",
+        "id",
+        "hostname",
+      ];
+
+    const trimmed =
+      command.trim();
+
+    const firstWord =
+      trimmed.split(
+        /\s+/
+      )[0];
+
+    if (
+      !ALLOWED_COMMANDS.includes(
+        firstWord
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          `Command '${firstWord}' is not in the allowed CyberLab diagnostic whitelist.`,
+        whitelist:
+          ALLOWED_COMMANDS,
+      });
+    }
+
+    // --------------------------------------------------------
+    // BLOCK SHELL CONTROL OPERATORS
+    // --------------------------------------------------------
+
+    const dangerousShellPatterns =
+      [
+        /;/,
+        /&&/,
+        /\|\|/,
+        /\|/,
+        /`/,
+        /\$\(/,
+        />/,
+        /</,
+        /\n/,
+        /\r/,
+      ];
+
+    if (
+      dangerousShellPatterns.some(
+        (pattern) =>
+          pattern.test(
+            trimmed
+          )
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          "Shell chaining, redirection, command substitution, and pipelines are not permitted.",
+      });
+    }
+
+    const startTime =
+      Date.now();
+
+    const runResult =
+      await runShellCommand(
+        trimmed,
+        12000
+      );
+
+    const responsePayload:
+      TerminalExecutionResponse = {
+        commandRun:
+          trimmed,
+
+        exitCode:
+          runResult.exitCode,
+
+        stdout:
+          runResult.stdout,
+
+        stderr:
+          runResult.stderr,
+
+        executionTimeMs:
+          runResult.durationMs,
+
+        timestamp:
+          new Date().toISOString(),
+
+        success:
+          runResult.exitCode ===
+          0,
+      };
+
+    addScanHistory({
+      id:
+        `cmd-${Date.now()}`,
+
+      timestamp:
+        new Date().toISOString(),
+
+      type:
+        "terminal-command",
+
+      target:
+        target ||
+        "host",
+
+      commandExecuted:
+        trimmed,
+
+      durationMs:
+        Date.now() -
+        startTime,
+
+      status:
+        runResult.exitCode ===
+        0
+          ? "success"
+          : "failed",
+
+      hostsFound:
+        0,
+
+      openPortsTotal:
+        0,
+
+      vulnerabilitiesCount: {
+        critical:
+          0,
+        high:
+          0,
+        medium:
+          0,
+        low:
+          0,
+        info:
+          0,
+      },
+
+      rawTerminalOutput:
+        runResult.stdout ||
+        runResult.stderr,
+    });
+
+    return res.json(
+      responsePayload
+    );
+  }
+);
+
+// ============================================================
+// 8. AI SECURITY REPORT
+// ============================================================
+
+app.post(
+  "/api/report/generate",
+  async (req, res) => {
+    try {
+      const {
+       scanId,
+       targetScope = "Kali Host & Lab Targets",
+       findings = [],
+       hostCount = 1,
+       portCount = 0,
+       } = req.body || {};
+
+       let selectedScan: ScanRunRecord | null = null;
+
+       if (scanId) {
+       selectedScan = getScanById(String(scanId));
+
+       if (!selectedScan) {
+       return res.status(404).json({
+      error: `Scan not found: ${scanId}`,
+    });
+  }
+}
+      const ai =
+        getGeminiClient();
+
+      let allFindings:
+        VulnerabilityFinding[] =
+        Array.isArray(findings)
+          ? findings
+          : [];
+
+      // ------------------------------------------------------
+      // GATHER FINDINGS FOR SELECTED SCAN
+      // ------------------------------------------------------
+
+      if (
+        selectedScan?.results?.vulnerabilities
+      ) {
+        allFindings = [
+          ...selectedScan.results.vulnerabilities,
+        ];
+      }
+
+      // ------------------------------------------------------
+      // DEDUPLICATE
+      // ------------------------------------------------------
+
+      const uniqueFindingsMap =
+        new Map<
+          string,
+          VulnerabilityFinding
+        >();
+
+      for (
+        const finding of allFindings
+      ) {
+        if (
+          !uniqueFindingsMap.has(
+            finding.title
+          )
+        ) {
+          uniqueFindingsMap.set(
+            finding.title,
+            finding
+          );
+        }
+      }
+
+      const deduplicatedFindings =
+        Array.from(
+          uniqueFindingsMap.values()
+        );
+
+      const criticalCount =
+        deduplicatedFindings.filter(
+          (f) =>
+            f.severity ===
+            "critical"
+        ).length;
+
+      const highCount =
+        deduplicatedFindings.filter(
+          (f) =>
+            f.severity ===
+            "high"
+        ).length;
+
+      const mediumCount =
+        deduplicatedFindings.filter(
+          (f) =>
+            f.severity ===
+            "medium"
+        ).length;
+
+      // ------------------------------------------------------
+      // DEFAULT RISK
+      // ------------------------------------------------------
+
+      let overallRisk:
+        RemediationReport["overallRiskLevel"] =
+        "Secure";
+
+      let riskScore =
+        15;
+
+      if (
+        criticalCount >
+        0
+      ) {
+        overallRisk =
+          "Critical";
+
+        riskScore =
+          Math.min(
+            100,
+            85 +
+              criticalCount *
+                5
+          );
+      } else if (
+        highCount >
+        0
+      ) {
+        overallRisk =
+          "High";
+
+        riskScore =
+          Math.min(
+            84,
+            65 +
+              highCount *
+                6
+          );
+      } else if (
+        mediumCount >
+        0
+      ) {
+        overallRisk =
+          "Medium";
+
+        riskScore =
+          45;
+      } else if (
+        deduplicatedFindings.length >
+        0
+      ) {
+        overallRisk =
+          "Low";
+
+        riskScore =
+          25;
+      }
+
+
+const lowCount = deduplicatedFindings.filter(
+  (f) => f.severity === "low"
+).length;
+
+const infoCount = deduplicatedFindings.filter(
+  (f) => f.severity === "info"
+).length;
+
+const affectedTargets = [
+  ...new Set(
+    deduplicatedFindings.map((f) => f.target)
+  ),
+];
+
+const affectedCategories = [
+  ...new Set(
+    deduplicatedFindings.map((f) => f.category)
+  ),
+];
+
+const topRiskAreas = deduplicatedFindings
+  .filter(
+    (f) =>
+      f.severity === "critical" ||
+      f.severity === "high"
+  )
+  .slice(0, 5)
+  .map((f) => f.title);
+
+let summaryText =
+  `The Kali CyberLab defensive security assessment was conducted against the defined scope ` +
+  `'${targetScope}'. The assessment identified ${deduplicatedFindings.length} security finding(s) ` +
+  `across ${affectedTargets.length} affected target(s), with ${portCount} open port(s) observed. ` +
+  `The overall security posture is currently rated ${overallRisk} with a risk score of ${riskScore}/100.\n\n` +
+
+  `Severity analysis identified ${criticalCount} critical, ${highCount} high, ` +
+  `${mediumCount} medium, ${lowCount} low, and ${infoCount} informational finding(s). ` +
+  `The assessment indicates that the primary areas requiring attention include ` +
+  `${affectedCategories.length > 0 ? affectedCategories.join(", ") : "network and service configuration"}. ` +
+  `${topRiskAreas.length > 0
+    ? `The most significant risks include: ${topRiskAreas.join("; ")}.`
+    : "No critical or high-severity exposure was identified during the assessment."}\n\n` +
+
+  `From a defensive perspective, remediation should be prioritized according to severity and ` +
+  `potential business or operational impact. Critical findings should be addressed immediately, ` +
+  `followed by high-severity findings within the defined remediation window. Medium and lower-risk ` +
+  `issues should then be incorporated into the organization's regular security hardening and ` +
+  `maintenance cycle.\n\n` +
+
+  `This report provides the assessment results, vulnerability details, security impact, recommended ` +
+  `Kali Linux remediation commands, prioritized remediation roadmap, and final security posture ` +
+  `to support technical teams in reducing the identified attack surface.`;      
+
+      let roadmap: RemediationReport["remediationRoadmap"] =
+        deduplicatedFindings.map(          
+          (
+            finding,
+            index
+          ) => ({
+            step:
+              index + 1,
+
+            phase:
+              finding.category.toUpperCase(),
+
+            priority:
+              finding.severity ===
+              "critical"
+                ? "Immediate (0-24h)"
+                : finding.severity ===
+                  "high"
+                ? "High (1-3 days)"
+                : "Medium (1 week)",
+
+            action:
+              `Remediate ${finding.title}: ${finding.remediationAdvice}`,
+
+            commands:
+              finding.kaliCommands ||
+              [
+                "sudo ufw status",
+              ],
+          })
+        );
+
+      // ------------------------------------------------------
+      // GEMINI
+      // ------------------------------------------------------
+
+      if (
+        ai &&
+        deduplicatedFindings.length >
+          0
+      ) {
+        try {
+          const prompt = `
+You are a Senior Kali Linux Penetration Tester and Defensive Cyber Security Engineer.
+
+Analyze the following real security findings from a controlled cyber lab.
+
+Target Scope:
+${targetScope}
+
+Total Discovered Open Ports:
+${portCount}
+
+Vulnerabilities:
+${JSON.stringify(
+  deduplicatedFindings,
+  null,
+  2
+)}
+
+Return valid JSON only using this structure:
+
+{
+  "summaryText": "2-3 concise executive paragraphs",
+  "overallRiskLevel": "Critical",
+  "riskScore": 0,
+  "roadmap": [
+    {
+      "step": 1,
+      "phase": "Network Hardening",
+      "priority": "Immediate (0-24h)",
+      "action": "Clear remediation action",
+      "commands": [
+        "sudo ..."
+      ]
+    }
+  ]
+}
+
+The overallRiskLevel must be one of:
+Critical, High, Medium, Low, Secure.
+
+RiskScore must be an integer from 0 to 100.
+
+Prioritize defensive remediation.
+`;
+
+          const aiResponse =
+            await ai.models.generateContent(
+              {
+                model:
+                  "gemini-3.7-flash",
+
+                contents:
+                  prompt,
+
+                config: {
+                  responseMimeType:
+                    "application/json",
+                },
+              }
+            );
+
+          const aiText =
+            aiResponse.text?.trim() ||
+            "{}";
+
+          const parsedAi =
+            JSON.parse(
+              aiText
+            );
+
+          if (
+            typeof parsedAi.summaryText ===
+              "string"
+          ) {
+            summaryText =
+              parsedAi.summaryText;
+          }
+
+          if (
+            [
+              "Critical",
+              "High",
+              "Medium",
+              "Low",
+              "Secure",
+            ].includes(
+              parsedAi.overallRiskLevel
+            )
+          ) {
+            overallRisk =
+              parsedAi.overallRiskLevel;
+          }
+
+          if (
+            typeof parsedAi.riskScore ===
+              "number"
+          ) {
+            riskScore =
+              Math.max(
+                0,
+                Math.min(
+                  100,
+                  Math.round(
+                    parsedAi.riskScore
+                  )
+                )
+              );
+          }
+
+          if (
+            Array.isArray(
+              parsedAi.roadmap
+            ) &&
+            parsedAi.roadmap.length >
+              0
+          ) {
+            roadmap =
+              parsedAi.roadmap;
+          }
+        } catch (aiError) {
+          console.warn(
+            "Gemini generation failed. Using offline remediation engine.",
+            aiError
+          );
+        }
+      }
+
+      // ------------------------------------------------------
+      // REPORT
+      // ------------------------------------------------------
+
+     const report: IndividualScanReport = {
+  id: `report-${Date.now()}`,
+
+  scanId: selectedScan?.id,
+
+  reportType:
+    selectedScan?.type === "web"
+      ? "web"
+      : "network",
+
+  title:
+    selectedScan
+      ? `Network Security Assessment: ${selectedScan.target}`
+      : `CyberLab Defensive Assessment: ${targetScope}`,
+
+  generatedAt: new Date().toISOString(),
+
+  target:
+    selectedScan?.target ||
+    targetScope ||
+    "Kali CyberLab Infrastructure",
+
+  methodology:
+    selectedScan
+      ? `Security assessment performed using Kali CyberLab network scanning and service enumeration. Scan type: ${selectedScan.type}.`
+      : "Security assessment performed using Kali CyberLab defensive scanning and vulnerability analysis.",
+
+  commandExecuted:
+    selectedScan?.commandExecuted,
+
+  durationMs:
+    selectedScan?.durationMs,
+
+  overallRiskLevel:
+    overallRisk,
+
+  riskScore,
+
+  executiveSummary:
+    summaryText,
+
+  scope: {
+    hostsScanned:
+      selectedScan
+        ? selectedScan.hostsFound
+        : Number(hostCount) || 1,
+
+    openPorts:
+      selectedScan
+        ? selectedScan.openPortsTotal
+        : Number(portCount) || 0,
+
+    vulnerabilities:
+      deduplicatedFindings.length,
+  },
+
+  assets:
+    selectedScan?.results?.hosts || [],
+
+  findings:
+    deduplicatedFindings,
+
+  recommendations:
+    roadmap.map((step) => ({
+     priority:
+     step.priority,
+
+      title:
+        step.action,
+
+      reason:
+        `Priority: ${step.priority}. This remediation item was generated from the security findings identified during the assessment.`,
+
+      action:
+        step.action,
+
+      commands:
+        step.commands || [],
+
+      verification:
+        [],
+    })),
+
+  conclusion:
+    deduplicatedFindings.length === 0
+      ? "No vulnerabilities were identified within the assessed scope. Continue routine monitoring, patch management, and periodic security assessments."
+      : `The assessment identified ${deduplicatedFindings.length} security finding(s). Remediation should be prioritized according to severity, beginning with Critical and High-risk findings.`,
+
+  rawEvidence:
+    selectedScan
+      ? [
+          `Scan ID: ${selectedScan.id}`,
+          `Target: ${selectedScan.target}`,
+          `Scan Type: ${selectedScan.type}`,
+          `Command Executed: ${selectedScan.commandExecuted}`,
+          `Duration: ${selectedScan.durationMs} ms`,
+          `Hosts Found: ${selectedScan.hostsFound}`,
+          `Open Ports: ${selectedScan.openPortsTotal}`,
+          `Vulnerabilities: ${selectedScan.vulnerabilitiesCount.critical} critical, ${selectedScan.vulnerabilitiesCount.high} high, ${selectedScan.vulnerabilitiesCount.medium} medium, ${selectedScan.vulnerabilitiesCount.low} low, ${selectedScan.vulnerabilitiesCount.info} informational`,
+          `Raw Scanner Output:\n${selectedScan.rawTerminalOutput}`,
+        ].join("\n")
+      : `Assessment generated at ${new Date().toUTCString()} on Kali Linux Host.`,
+};
+
+        return res.json(
+        report
+      );
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Report generation failed",
+      });
+    }
+  }
+);
+
+// ============================================================
+// 9. KALI SERVER MIGRATION GUIDE
+// ============================================================
+
+app.get(
+  "/api/export/kali-instructions",
+  (_req, res) => {
+    const serviceFileContent = `[Unit]
+Description=Kali CyberLab Operations Suite Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/kali-cyberlab
+ExecStart=/opt/kali-cyberlab/.venv/bin/python3 app.py
+Restart=always
+RestartSec=5
+Environment=PORT=9090
+
+[Install]
+WantedBy=multi-user.target
+`;
+
+    const installScript = `#!/usr/bin/env bash
+
+# Kali CyberLab Setup Script for Kali Linux Server
+
+set -e
+
+echo "[+] Updating Kali package lists..."
+sudo apt-get update -y
+
+echo "[+] Installing networking and Python security tools..."
+
+sudo apt-get install -y \\
+  python3 \\
+  python3-pip \\
+  python3-venv \\
+  nmap \\
+  curl \\
+  traceroute \\
+  iproute2 \\
+  ufw \\
+  tcpdump \\
+  net-tools
+
+echo "[+] Creating Python virtual environment..."
+
+python3 -m venv .venv
+
+source .venv/bin/activate
+
+echo "[+] Installing Python dependencies..."
+
+pip install --upgrade pip
+
+if [ -f requirements.txt ]; then
+  pip install -r requirements.txt
+fi
+
+echo "[✓] Kali CyberLab Python environment is ready!"
+
+echo "[+] Flask:"
+echo "    PORT=9090 python3 app.py"
+
+echo "[+] Django:"
+echo "    python3 manage.py runserver 0.0.0.0:9000"
+`;
+
+    res.json({
+      serviceFileContent,
+
+      installScript,
+
+      commands: [
+        "scp -r ./kali-cyberlab user@kali-ip:/opt/kali-cyberlab",
+        "cd /opt/kali-cyberlab",
+        "chmod +x setup_python.sh && ./setup_python.sh",
+        "PORT=9090 python3 app.py",
+        "sudo cp cyberlab.service /etc/systemd/system/",
+        "sudo systemctl daemon-reload",
+        "sudo systemctl enable --now cyberlab",
+      ],
+    });
+  }
+);
+
+// ============================================================
+// 10. PYTHON TELEMETRY
+// ============================================================
+
+app.get(
+  "/api/python/telemetry",
+  async (_req, res) => {
+    try {
+      const pyResult =
+        await runShellCommand(
+          "python3 telemetry.py",
+          6000
+        );
+
+      if (
+        pyResult.exitCode ===
+          0 &&
+        pyResult.stdout
+      ) {
+        try {
+          const parsed =
+            JSON.parse(
+              pyResult.stdout
+            );
+
+          return res.json(
+            parsed
+          );
+        } catch {
+          return res.json({
+            raw:
+              pyResult.stdout,
+
+            source:
+              "python3 telemetry.py",
+          });
+        }
+      }
+
+      return res.status(500).json({
+        error:
+          "Failed to execute python3 telemetry.py",
+
+        details:
+          pyResult.stderr,
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Python telemetry execution error",
+      });
+    }
+  }
+);
+
+// ============================================================
+// 11. PYTHON CODE VIEWER
+// ============================================================
+
+app.get(
+  "/api/python/code",
+  async (_req, res) => {
+    try {
+      const [
+        telemetryPy,
+        appPy,
+        djangoViews,
+        djangoUrls,
+        djangoSettings,
+        reqsTxt,
+        setupSh,
+      ] = await Promise.all([
+        runShellCommand(
+          "cat telemetry.py 2>/dev/null"
+        ),
+
+        runShellCommand(
+          "cat app.py 2>/dev/null"
+        ),
+
+        runShellCommand(
+          "cat django_cyberlab/views.py 2>/dev/null"
+        ),
+
+        runShellCommand(
+          "cat django_cyberlab/urls.py 2>/dev/null"
+        ),
+
+        runShellCommand(
+          "cat django_cyberlab/settings.py 2>/dev/null"
+        ),
+
+        runShellCommand(
+          "cat requirements.txt 2>/dev/null"
+        ),
+
+        runShellCommand(
+          "cat setup_python.sh 2>/dev/null"
+        ),
+      ]);
+
+      return res.json({
+        files: [
+          {
+            name:
+              "app.py",
+
+            framework:
+              "Flask",
+
+            description:
+              "Python Flask CyberLab backend.",
+
+            content:
+              appPy.stdout,
+          },
+
+          {
+            name:
+              "telemetry.py",
+
+            framework:
+              "Pure Python 3",
+
+            description:
+              "Linux host telemetry reader.",
+
+            content:
+              telemetryPy.stdout,
+          },
+
+          {
+            name:
+              "django_cyberlab/views.py",
+
+            framework:
+              "Django",
+
+            description:
+              "Django CyberLab API views.",
+
+            content:
+              djangoViews.stdout,
+          },
+
+          {
+            name:
+              "django_cyberlab/urls.py",
+
+            framework:
+              "Django",
+
+            description:
+              "Django URL routing.",
+
+            content:
+              djangoUrls.stdout,
+          },
+
+          {
+            name:
+              "django_cyberlab/settings.py",
+
+            framework:
+              "Django",
+
+            description:
+              "Django configuration.",
+
+            content:
+              djangoSettings.stdout,
+          },
+
+          {
+            name:
+              "requirements.txt",
+
+            framework:
+              "Python Dependencies",
+
+            description:
+              "Python package dependencies.",
+
+            content:
+              reqsTxt.stdout,
+          },
+
+          {
+            name:
+              "setup_python.sh",
+
+            framework:
+              "Shell Script",
+
+            description:
+              "Kali Linux Python environment setup script.",
+
+            content:
+              setupSh.stdout,
+          },
+        ],
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Failed to load Python code",
+      });
+    }
+  }
+);
+
+// ============================================================
+// 12. PYTHON EXECUTION
+// ============================================================
+
+app.post(
+  "/api/python/exec",
+  async (req, res) => {
+    const {
+      code,
+    } = req.body || {};
+
+    if (
+      !code ||
+      typeof code !==
+        "string"
+    ) {
+      return res.status(400).json({
+        error:
+          "No Python code provided",
+      });
+    }
+
+    if (
+      code.length >
+      10000
+    ) {
+      return res.status(400).json({
+        error:
+          "Python code exceeds the 10,000 character limit.",
+      });
+    }
+
+    const result =
+      await runShellCommand(
+        `python3 -c ${JSON.stringify(code)}`,
+        10000
+      );
+
+    return res.json({
+      stdout:
+        result.stdout,
+
+      stderr:
+        result.stderr,
+
+      exitCode:
+        result.exitCode,
+
+      executionTimeMs:
+        result.durationMs,
+
+      timestamp:
+        new Date().toISOString(),
+    });
+  }
+);
+
+// ============================================================
+// 13. HEALTH CHECK
+// ============================================================
+
+app.get(
+  "/api/health",
+  (_req, res) => {
+    res.json({
+      status:
+        "ok",
+
+      service:
+        "Kali CyberLab",
+
+      version:
+        "1.0.0",
+
+      timestamp:
+        new Date().toISOString(),
+    });
+  }
+);
+
+// ============================================================
+// 14. SECURITY ARSENAL INTEGRATION LAYER
+// ============================================================
+
+type IntegrationStatus = {
+  id: string;
+  name: string;
+  url: string;
+  status: "online" | "offline" | "not-configured";
+  responseTimeMs: number | null;
+  message: string;
+  checkedAt: string;
+};
+
+function checkHttpIntegration(
+  id: string,
+  name: string,
+  url: string
+): Promise<IntegrationStatus> {
+  return new Promise((resolve) => {
+    const checkedAt = new Date().toISOString();
+    const startTime = Date.now();
+
+    if (!url) {
+      return resolve({
+        id,
+        name,
+        url: "",
+        status: "not-configured",
+        responseTimeMs: null,
+        message: "Integration URL is not configured.",
+        checkedAt,
+      });
+    }
+
+    let parsedUrl: URL;
+
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      return resolve({
+        id,
+        name,
+        url,
+        status: "offline",
+        responseTimeMs: null,
+        message: "Invalid integration URL.",
+        checkedAt,
+      });
+    }
+
+    const client =
+      parsedUrl.protocol === "https:"
+        ? https
+        : parsedUrl.protocol === "http:"
+          ? http
+          : null;
+
+    if (!client) {
+      return resolve({
+        id,
+        name,
+        url,
+        status: "offline",
+        responseTimeMs: null,
+        message: `Unsupported protocol: ${parsedUrl.protocol}`,
+        checkedAt,
+      });
+    }
+
+    const request = client.request(
+      parsedUrl,
+      {
+        method: "GET",
+        timeout: 5000,
+        rejectUnauthorized: false,
+      },
+      (response) => {
+        const responseTimeMs =
+          Date.now() - startTime;
+
+        response.resume();
+
+        const statusCode =
+          response.statusCode || 0;
+
+        const isOnline =
+          statusCode >= 200 &&
+          statusCode < 500;
+
+        resolve({
+          id,
+          name,
+          url,
+          status: isOnline
+            ? "online"
+            : "offline",
+          responseTimeMs,
+          message: isOnline
+            ? `Service responded with HTTP ${statusCode}.`
+            : `Service returned HTTP ${statusCode}.`,
+          checkedAt,
+        });
+      }
+    );
+
+    request.on("timeout", () => {
+      request.destroy();
+
+      resolve({
+        id,
+        name,
+        url,
+        status: "offline",
+        responseTimeMs: Date.now() - startTime,
+        message: "Connection timed out.",
+        checkedAt,
+      });
+    });
+
+    request.on("error", (error: Error) => {
+      resolve({
+        id,
+        name,
+        url,
+        status: "offline",
+        responseTimeMs: Date.now() - startTime,
+        message:
+          error.message ||
+          "Unable to connect to integration.",
+        checkedAt,
+      });
+    });
+
+    request.end();
+  });
+}
+
+app.get(
+  "/api/integrations/status",
+  async (_req, res) => {
+    try {
+      const greenboneUrl =
+        process.env.GREENBONE_URL || "";
+
+      const observiumUrl =
+        process.env.OBSERVIUM_URL || "";
+
+      const [
+        greenbone,
+        observium,
+      ] = await Promise.all([
+        checkHttpIntegration(
+          "greenbone",
+          "Greenbone / OpenVAS",
+          greenboneUrl
+        ),
+
+        checkHttpIntegration(
+          "observium",
+          "Observium",
+          observiumUrl
+        ),
+      ]);
+
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+
+        integrations: [
+          greenbone,
+          observium,
+        ],
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Failed to check Security Arsenal integrations.",
+      });
+    }
+  }
+);
+
+  // ============================================================
+  // 14A. GREENBONE GMP API
+  // ============================================================
+
+  app.get(
+    "/api/integrations/greenbone/status",
+    async (_req, res) => {
+      try {
+        const result =
+          await runGreenboneGmpCommand(
+            "<get_version/>"
+          );
+
+        return res.json({
+          status:
+            result.statusCode === 200
+              ? "online"
+              : "offline",
+
+          statusCode:
+            result.statusCode,
+
+          statusText:
+            result.statusText,
+
+          xml:
+            result.xml,
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(500).json({
+          status: "offline",
+
+          error:
+            err?.message ||
+            "Failed to connect to Greenbone GMP.",
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      }
+    }
+  );
+
+  app.get(
+    "/api/integrations/greenbone/tasks",
+    async (_req, res) => {
+      try {
+        const result =
+          await runGreenboneGmpCommand(
+            "<get_tasks/>"
+          );
+
+        return res.json({
+          statusCode:
+            result.statusCode,
+
+          statusText:
+            result.statusText,
+
+          xml:
+            result.xml,
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(500).json({
+          error:
+            err?.message ||
+            "Failed to retrieve Greenbone tasks.",
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      }
+    }
+  );
+  app.get(
+    "/api/integrations/greenbone/scanners",
+    async (_req, res) => {
+      try {
+        const result =
+          await runGreenboneGmpCommand(
+            `<get_scanners details="1"/>`
+          );
+
+        return res.json({
+          statusCode:
+            result.statusCode,
+
+          statusText:
+            result.statusText,
+
+          xml:
+            result.xml,
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(500).json({
+          error:
+            err?.message ||
+            "Failed to retrieve Greenbone scanners.",
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      }
+    }
+  );
+
+  app.get(
+    "/api/integrations/greenbone/configs",
+    async (_req, res) => {
+      try {
+        const result =
+          await runGreenboneGmpCommand(
+            `<get_configs/>`
+          );
+
+        return res.json({
+          statusCode:
+            result.statusCode,
+
+          statusText:
+            result.statusText,
+
+          xml:
+            result.xml,
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(500).json({
+          error:
+            err?.message ||
+            "Failed to retrieve Greenbone scan configurations.",
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      }
+    }
+  );
+
+       app.get(
+      "/api/integrations/greenbone/targets",
+    async (_req, res) => {
+      try {
+        const result =
+          await runGreenboneGmpCommand(
+            `<get_targets details="1"/>`
+          );
+
+        return res.json({
+          statusCode:
+            result.statusCode,
+
+          statusText:
+            result.statusText,
+
+          xml:
+            result.xml,
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(500).json({
+          error:
+            err?.message ||
+            "Failed to retrieve Greenbone targets.",
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      }
+    }
+  );
+
+  app.get(
+    "/api/integrations/greenbone/reports/:reportId",
+    async (req, res) => {
+      try {
+        const {
+          reportId,
+        } = req.params;
+
+        if (
+          !reportId ||
+          !/^[0-9a-fA-F-]{36}$/.test(
+            reportId
+          )
+        ) {
+          return res.status(400).json({
+            error:
+              "Invalid Greenbone report ID.",
+          });
+        }
+
+       const xmlCommand =
+  `<get_reports report_id="${escapeXml(
+    reportId
+  )}" details="1" filter="apply_overrides=0 min_qod=70 first=1 rows=1000 sort=name"/>`;
+
+        const result =
+          await runGreenboneGmpCommand(
+            xmlCommand
+          );
+
+        return res.json({
+          reportId,
+
+          statusCode:
+            result.statusCode,
+
+          statusText:
+            result.statusText,
+
+          xml:
+            result.xml,
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(500).json({
+          error:
+            err?.message ||
+            "Failed to retrieve Greenbone report.",
+        });
+      }
+    }
+  );
+
+  // ============================================================
+  // 14B. GREENBONE SCAN CREATION
+  // ============================================================
+
+  app.post(
+    "/api/integrations/greenbone/scan",
+    async (req, res) => {
+      try {
+        const {
+          name,
+          target,
+          configId,
+          scannerId,
+        } = req.body || {};
+
+        // ------------------------------------------------------
+        // Validate input
+        // ------------------------------------------------------
+
+        if (
+          !target ||
+          typeof target !== "string"
+        ) {
+          return res.status(400).json({
+            error:
+              "A Greenbone target is required.",
+          });
+        }
+
+        if (
+          !configId ||
+          typeof configId !== "string" ||
+          !/^[0-9a-fA-F-]{36}$/.test(
+            configId
+          )
+        ) {
+          return res.status(400).json({
+            error:
+              "A valid Greenbone scan configuration ID is required.",
+          });
+        }
+
+        const selectedScannerId =
+          scannerId ||
+          "6acd0832-df90-11e4-b9d5-28d24461215b";
+
+        if (
+          !/^[0-9a-fA-F-]{36}$/.test(
+            selectedScannerId
+          )
+        ) {
+          return res.status(400).json({
+            error:
+              "Invalid Greenbone scanner ID.",
+          });
+        }
+
+        const scanName =
+          typeof name === "string" &&
+          name.trim()
+            ? name.trim()
+            : `CyberLab Greenbone Scan - ${target}`;
+
+        // ------------------------------------------------------
+        // 1. CREATE TARGET
+        // ------------------------------------------------------
+
+        const targetXml =
+  `<create_target>` +
+  `<name>${escapeXml(
+    scanName
+  )}</name>` +
+  `<hosts>${escapeXml(
+    target.trim()
+  )}</hosts>` +
+  `<port_list id="33d0cd82-57c6-11e1-8ed1-406186ea4fc5"/>` +
+  `</create_target>`;
+
+        const targetResult =
+          await runGreenboneGmpCommand(
+            targetXml,
+            30000
+          );
+
+        if (
+          targetResult.statusCode < 200 ||
+          targetResult.statusCode >= 300
+        ) {
+          return res.status(502).json({
+            error:
+              "Greenbone failed to create the target.",
+            statusCode:
+              targetResult.statusCode,
+            statusText:
+              targetResult.statusText,
+            xml:
+              targetResult.xml,
+          });
+        }
+
+        // ------------------------------------------------------
+        // Extract target ID
+        // ------------------------------------------------------
+
+        const targetIdMatch =
+          targetResult.xml.match(
+            /<create_target_response[^>]*id="([^"]+)"/
+          );
+
+        const targetId =
+          targetIdMatch?.[1] || null;
+
+        if (!targetId) {
+          return res.status(502).json({
+            error:
+              "Greenbone created the target response but no target ID was returned.",
+            xml:
+              targetResult.xml,
+          });
+        }
+
+        // ------------------------------------------------------
+        // 2. CREATE TASK
+        // ------------------------------------------------------
+
+        const taskXml =
+          `<create_task>` +
+          `<name>${escapeXml(
+            scanName
+          )}</name>` +
+          `<comment>Created by Kali CyberLab.</comment>` +
+          `<config id="${escapeXml(
+            configId
+          )}"/>` +
+          `<target id="${escapeXml(
+            targetId
+          )}"/>` +
+          `<scanner id="${escapeXml(
+            selectedScannerId
+          )}"/>` +
+          `</create_task>`;
+
+        const taskResult =
+          await runGreenboneGmpCommand(
+            taskXml,
+            30000
+          );
+
+        if (
+          taskResult.statusCode < 200 ||
+          taskResult.statusCode >= 300
+        ) {
+          return res.status(502).json({
+            error:
+              "Greenbone failed to create the scan task.",
+            targetId,
+            statusCode:
+              taskResult.statusCode,
+            statusText:
+              taskResult.statusText,
+            xml:
+              taskResult.xml,
+          });
+        }
+
+        // ------------------------------------------------------
+        // Extract task ID
+        // ------------------------------------------------------
+
+        const taskIdMatch =
+          taskResult.xml.match(
+            /<create_task_response[^>]*id="([^"]+)"/
+          );
+
+        const taskId =
+          taskIdMatch?.[1] || null;
+
+        if (!taskId) {
+          return res.status(502).json({
+            error:
+              "Greenbone created the task response but no task ID was returned.",
+            targetId,
+            xml:
+              taskResult.xml,
+          });
+        }
+
+        // ------------------------------------------------------
+        // 3. START TASK
+        // ------------------------------------------------------
+
+        const startXml =
+          `<start_task task_id="${escapeXml(
+            taskId
+          )}"/>`;
+
+        const startResult =
+          await runGreenboneGmpCommand(
+            startXml,
+            30000
+          );
+
+        if (
+          startResult.statusCode < 200 ||
+          startResult.statusCode >= 300
+        ) {
+          return res.status(502).json({
+            error:
+              "Greenbone created the task but failed to start it.",
+            targetId,
+            taskId,
+            statusCode:
+              startResult.statusCode,
+            statusText:
+              startResult.statusText,
+            xml:
+              startResult.xml,
+          });
+        }
+
+        // ------------------------------------------------------
+        // Extract report ID if Greenbone immediately provides one
+        // ------------------------------------------------------
+
+        const reportIdMatch =
+          startResult.xml.match(
+            /<report[^>]*id="([^"]+)"/
+          );
+
+        const reportId =
+          reportIdMatch?.[1] || null;
+
+        // ------------------------------------------------------
+        // SUCCESS
+        // ------------------------------------------------------
+
+        return res.status(201).json({
+          success: true,
+
+          message:
+            "Greenbone scan created and started successfully.",
+
+          scan: {
+            name: scanName,
+            target:
+              target.trim(),
+            targetId,
+            taskId,
+            reportId,
+            configId,
+            scannerId:
+              selectedScannerId,
+          },
+
+          targetResponse: {
+            statusCode:
+              targetResult.statusCode,
+            statusText:
+              targetResult.statusText,
+          },
+
+          taskResponse: {
+            statusCode:
+              taskResult.statusCode,
+            statusText:
+              taskResult.statusText,
+          },
+
+          startResponse: {
+            statusCode:
+              startResult.statusCode,
+            statusText:
+              startResult.statusText,
+          },
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      } catch (err: any) {
+        console.error(
+          "Greenbone scan creation failed:",
+          err
+        );
+
+        return res.status(500).json({
+          error:
+            err?.message ||
+            "Failed to create Greenbone scan.",
+
+          timestamp:
+            new Date().toISOString(),
+        });
+      }
+    }
+  );
+
+
+// ============================================================
+// 15. VITE / STATIC FRONTEND
+// ============================================================
+
+// ============================================================
+// 14. VITE / STATIC FRONTEND
+// ============================================================
+
+async function startServer(): Promise<void> {
+  try {
+    // --------------------------------------------------------
+    // DEVELOPMENT MODE - Vite middleware
+    // --------------------------------------------------------
+
+    if (process.env.NODE_ENV !== "production") {
+      const vite = await createViteServer({
+        server: {
+          middlewareMode: true,
+        },
+        appType: "spa",
+      });
+
+      app.use(vite.middlewares);
+    } else {
+      // ------------------------------------------------------
+      // PRODUCTION MODE - Serve compiled frontend
+      // ------------------------------------------------------
+
+      const distPath = path.join(
+        process.cwd(),
+        "dist"
+      );
+
+      app.use(
+        express.static(distPath)
+      );
+
+      // Express 5 compatible SPA fallback.
+      app.use(
+        (_req, res) => {
+          res.sendFile(
+            path.join(
+              distPath,
+              "index.html"
+            )
+          );
+        }
+      );
+    }
+
+    // --------------------------------------------------------
+    // START HTTP SERVER
+    // --------------------------------------------------------
+
+    const server = app.listen(
+      PORT,
+      "0.0.0.0",
+      () => {
+        console.log(
+          `Kali CyberLab Operations Suite listening on http://0.0.0.0:${PORT}`
+        );
+      }
+    );
+
+    // --------------------------------------------------------
+    // GRACEFUL SHUTDOWN
+    // --------------------------------------------------------
+
+    const shutdown = () => {
+      console.log(
+        "\n[+] Shutting down Kali CyberLab..."
+      );
+
+      // Stop continuous scanner if running.
+      if (continuousIntervalTimer) {
+        clearInterval(
+          continuousIntervalTimer
+        );
+
+        continuousIntervalTimer = null;
+      }
+
+      // Stop HTTP server.
+      server.close(
+        () => {
+          console.log(
+            "[✓] Server stopped."
+          );
+
+          process.exit(0);
+        }
+      );
+    };
+
+    // Handle Ctrl+C.
+    process.once(
+      "SIGINT",
+      shutdown
+    );
+
+    // Handle system termination.
+    process.once(
+      "SIGTERM",
+      shutdown
+    );
+
+  } catch (error) {
+    console.error(
+      "Failed to start CyberLab server:",
+      error
+    );
+
+    process.exit(1);
+  }
+}
+
+// ============================================================
+// START CYBERLAB
+// ============================================================
+
+void startServer();

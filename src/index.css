@@ -1,0 +1,439 @@
+@import "tailwindcss";
+/* =========================================================
+   KALI CYBERLAB — PROFESSIONAL PDF REPORT
+   ========================================================= */
+
+@media print {
+
+  @page {
+    size: A4;
+    margin: 16mm 14mm 18mm 14mm;
+  }
+
+  html,
+  body {
+    background: white !important;
+    color: #111827 !important;
+  }
+
+  body {
+    font-family: Arial, Helvetica, sans-serif !important;
+    font-size: 10pt;
+    line-height: 1.5;
+  }
+
+  /* Hide application controls */
+  button,
+  form,
+  nav,
+  header,
+  .no-print {
+    display: none !important;
+  }
+
+  /* Remove dark application background */
+  .report-section,
+  .report-document,
+  .printable-report,
+  .report-container {
+    background: white !important;
+    color: #111827 !important;
+  }
+
+  /* Prevent dark cards from printing */
+  .bg-slate-950,
+  .bg-slate-900,
+  .bg-slate-900\/40 {
+    background: white !important;
+    color: #111827 !important;
+  }
+
+  .text-white {
+    color: #111827 !important;
+  }
+
+  .text-slate-300,
+  .text-slate-400,
+  .text-slate-500,
+  .text-slate-600 {
+    color: #374151 !important;
+  }
+
+  .border-slate-800,
+  .border-slate-700 {
+    border-color: #d1d5db !important;
+  }
+
+  /* Main report width */
+  .report-document {
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  /* ---------------------------------------------------------
+     REPORT HEADER
+     --------------------------------------------------------- */
+
+  .report-header {
+    border-bottom: 3px solid #111827;
+    padding-bottom: 18px;
+    margin-bottom: 25px;
+  }
+
+  .report-header h1 {
+    font-size: 23pt;
+    line-height: 1.15;
+    color: #111827 !important;
+    letter-spacing: -0.5px;
+  }
+
+  .report-header p {
+    color: #4b5563 !important;
+  }
+
+  /* ---------------------------------------------------------
+     SECTION HEADINGS
+     --------------------------------------------------------- */
+
+  .section-heading {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    border-bottom: 1px solid #d1d5db;
+    padding-bottom: 9px;
+    margin-bottom: 16px;
+  }
+
+  .section-heading > span {
+    font-size: 10pt;
+    font-weight: 800;
+    color: #059669 !important;
+    min-width: 28px;
+  }
+
+  .section-heading h2 {
+    margin: 0;
+    font-size: 15pt;
+    color: #111827 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  .section-heading p {
+    margin: 3px 0 0;
+    color: #6b7280 !important;
+    font-size: 8.5pt;
+  }
+
+  /* ---------------------------------------------------------
+     EXECUTIVE SUMMARY
+     --------------------------------------------------------- */
+
+  .executive-summary,
+  .executive-summary-box {
+    background: #f9fafb !important;
+    border: 1px solid #d1d5db !important;
+    border-left: 4px solid #059669 !important;
+    padding: 18px !important;
+    color: #1f2937 !important;
+  }
+
+  .executive-summary-box h3 {
+    margin: 0 0 10px;
+    font-size: 9pt;
+    font-weight: 800;
+    letter-spacing: 1px;
+    color: #059669 !important;
+  }
+
+  .executive-summary-box p {
+    margin: 0;
+    font-size: 10pt;
+    line-height: 1.7;
+    color: #1f2937 !important;
+  }
+
+  /* ---------------------------------------------------------
+     RISK / METRICS
+     --------------------------------------------------------- */
+
+  .recommendation-summary {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin: 15px 0 20px;
+  }
+
+  .recommendation-stat {
+    border: 1px solid #d1d5db;
+    background: #f9fafb !important;
+    padding: 13px;
+    text-align: center;
+  }
+
+  .recommendation-stat strong {
+    display: block;
+    font-size: 20pt;
+    line-height: 1;
+    color: #111827 !important;
+  }
+
+  .recommendation-stat span {
+    display: block;
+    margin-top: 6px;
+    font-size: 7pt;
+    font-weight: 800;
+    letter-spacing: 1px;
+    color: #6b7280 !important;
+  }
+
+  /* ---------------------------------------------------------
+     RECOMMENDATION CARDS
+     --------------------------------------------------------- */
+
+  .recommendation-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .recommendation-card {
+    border: 1px solid #d1d5db;
+    background: white !important;
+    padding: 15px;
+    break-inside: avoid;
+  }
+
+  .recommendation-card h3 {
+    margin: 0 0 7px;
+    font-size: 8.5pt;
+    color: #111827 !important;
+    letter-spacing: 0.5px;
+  }
+
+  .recommendation-card p {
+    margin: 0;
+    font-size: 9pt;
+    line-height: 1.55;
+    color: #4b5563 !important;
+  }
+
+  /* ---------------------------------------------------------
+     FINDINGS
+     --------------------------------------------------------- */
+
+  .finding-card,
+  .finding,
+  .vulnerability-card {
+    border: 1px solid #d1d5db !important;
+    background: white !important;
+    color: #111827 !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+    margin-bottom: 12px;
+  }
+
+  .finding-card h3,
+  .finding h3,
+  .vulnerability-card h3 {
+    color: #111827 !important;
+  }
+
+  /* ---------------------------------------------------------
+     ROADMAP
+     --------------------------------------------------------- */
+
+  .roadmap {
+    display: block;
+  }
+
+  .roadmap-item {
+    display: grid;
+    grid-template-columns: 48px 1fr;
+    gap: 14px;
+    border: 1px solid #d1d5db;
+    background: white !important;
+    margin-bottom: 12px;
+    padding: 14px;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .roadmap-step {
+    font-size: 16pt;
+    font-weight: 800;
+    color: #059669 !important;
+  }
+
+  .roadmap-content {
+    color: #111827 !important;
+  }
+
+  .roadmap-header {
+    display: flex;
+    justify-content: space-between;
+    gap: 15px;
+    border-bottom: 1px solid #e5e7eb;
+    padding-bottom: 7px;
+    margin-bottom: 8px;
+  }
+
+  .roadmap-header span {
+    display: block;
+    font-size: 7pt;
+    font-weight: 800;
+    color: #6b7280 !important;
+    letter-spacing: 1px;
+  }
+
+  .roadmap-header h3 {
+    margin: 2px 0 0;
+    font-size: 11pt;
+    color: #111827 !important;
+  }
+
+  .roadmap-header strong {
+    font-size: 7.5pt;
+    color: #b45309 !important;
+    white-space: nowrap;
+  }
+
+  .roadmap-content p {
+    font-size: 9pt;
+    color: #374151 !important;
+  }
+
+  /* ---------------------------------------------------------
+     COMMAND BOXES
+     --------------------------------------------------------- */
+
+  .command-box {
+    background: #111827 !important;
+    border: 1px solid #374151 !important;
+    padding: 10px;
+    margin-top: 8px;
+    break-inside: avoid;
+  }
+
+  .command-title {
+    font-size: 7pt;
+    font-weight: 800;
+    letter-spacing: 1px;
+    color: #6ee7b7 !important;
+    margin-bottom: 6px;
+  }
+
+  .command-line {
+    font-family: "Courier New", monospace !important;
+    font-size: 8pt;
+    color: #d1fae5 !important;
+    margin: 2px 0;
+    word-break: break-word;
+  }
+
+  /* ---------------------------------------------------------
+     CONCLUSION
+     --------------------------------------------------------- */
+
+  .conclusion-box {
+    border: 2px solid #111827 !important;
+    background: #f9fafb !important;
+    padding: 20px;
+    break-inside: avoid;
+  }
+
+  .conclusion-box h3 {
+    color: #111827 !important;
+    font-size: 13pt;
+  }
+
+  .conclusion-box p {
+    color: #374151 !important;
+    font-size: 9.5pt;
+    line-height: 1.6;
+  }
+
+  /* ---------------------------------------------------------
+     PAGE BREAKS
+     --------------------------------------------------------- */
+
+  .page-break-before {
+    page-break-before: always;
+    break-before: page;
+  }
+
+  .page-break-after {
+    page-break-after: always;
+    break-after: page;
+  }
+
+  .print-break-inside-avoid {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  .no-break {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  /* ---------------------------------------------------------
+     FOOTER / METADATA
+     --------------------------------------------------------- */
+
+  .report-footer {
+    margin-top: 30px;
+    padding-top: 10px;
+    border-top: 1px solid #d1d5db;
+    font-size: 7.5pt;
+    color: #6b7280 !important;
+  }
+
+  /* Recharts should remain visible */
+  .recharts-wrapper {
+    max-width: 100% !important;
+  }
+
+  /* Remove unnecessary shadows */
+  * {
+    box-shadow: none !important;
+  }
+}
+/* =========================================================
+   ASSESSMENT SUMMARY
+   ========================================================= */
+
+.assessment-summary {
+  margin-top: 24px;
+  padding: 24px 26px;
+  border: 1px solid #d9dee7;
+  border-left: 4px solid #0f766e;
+  background: #f8fafc;
+  color: #334155;
+  line-height: 1.75;
+}
+
+.assessment-summary .summary-title {
+  margin-bottom: 14px;
+  color: #0f766e;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.assessment-summary p {
+  margin: 0 0 12px 0;
+  font-size: 10.5px;
+}
+
+.assessment-summary p:last-child {
+  margin-bottom: 0;
+}
+
+.assessment-summary strong {
+  color: #111827;
+  font-weight: 700;
+}

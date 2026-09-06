@@ -1,0 +1,6 @@
+{
+  "name": "Kali CyberLab Operations Suite",
+  "description": "Full-stack Kali Linux cyber laboratory and defensive network scanner with live terminal command execution, 5-second interval scanning, vulnerability analysis, remediation advice, and report generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

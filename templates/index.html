@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kali CyberLab - Operations Suite</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        body { background-color: #070b14; color: #cbd5e1; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+        .glow-border { box-shadow: 0 0 15px -3px rgba(6, 182, 212, 0.15); }
+        .custom-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scroll::-webkit-scrollbar-track { background: #0c1322; }
+        .custom-scroll::-webkit-scrollbar-thumb { background: #1f2e4d; border-radius: 3px; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col antialiased">
+    <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <div class="w-8 h-8 rounded bg-gradient-to-tr from-cyan-600 to-emerald-400 flex items-center justify-center text-slate-950 font-black text-lg shadow">K</div>
+                <div>
+                    <h1 class="text-base font-bold tracking-wider text-slate-100 flex items-center gap-2">
+                        KALI CYBERLAB <span class="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-400 border border-cyan-500/40">PYTHON ENGINE</span>
+                    </h1>
+                    <p class="text-xs text-slate-400">Host: <span id="hdr-hostname" class="text-emerald-400 font-semibold">cuvuln</span> | Arch: Linux (<span id="hdr-pyver">Python 3</span>)</p>
+                </div>
+            </div>
+            <div class="flex items-center space-x-3 text-xs">
+                <div class="flex items-center space-x-2 px-3 py-1.5 rounded-full bg-emerald-950/60 border border-emerald-500/40 text-emerald-300">
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                    <span id="daemon-status" class="font-medium uppercase tracking-wider">LIVE DAEMON ACTIVE</span>
+                </div>
+                <button onclick="fetchTelemetry()" class="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition">
+                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i> Refresh
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <nav class="border-b border-slate-800 bg-slate-950/60">
+        <div class="max-w-7xl mx-auto px-4 flex space-x-1">
+            <button onclick="switchTab('telemetry')" id="tab-btn-telemetry" class="px-4 py-2.5 text-xs font-bold uppercase tracking-wider text-cyan-400 border-b-2 border-cyan-400 flex items-center gap-2">
+                <i data-lucide="activity" class="w-4 h-4"></i> System Telemetry
+            </button>
+            <button onclick="switchTab('scanner')" id="tab-btn-scanner" class="px-4 py-2.5 text-xs font-bold uppercase tracking-wider text-slate-400 hover:text-slate-200 border-b-2 border-transparent flex items-center gap-2">
+                <i data-lucide="radar" class="w-4 h-4"></i> Port Scanner
+            </button>
+            <button onclick="switchTab('terminal')" id="tab-btn-terminal" class="px-4 py-2.5 text-xs font-bold uppercase tracking-wider text-slate-400 hover:text-slate-200 border-b-2 border-transparent flex items-center gap-2">
+                <i data-lucide="terminal" class="w-4 h-4"></i> Diagnostic Terminal
+            </button>
+            <button onclick="switchTab('webscan')" id="tab-btn-webscan" class="px-4 py-2.5 text-xs font-bold uppercase tracking-wider text-slate-400 hover:text-slate-200 border-b-2 border-transparent flex items-center gap-2">
+                <i data-lucide="shield-check" class="w-4 h-4"></i> Web Security Inspector
+            </button>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-4 py-6 flex-1 w-full space-y-6">
+        <!-- TAB 1: SYSTEM TELEMETRY -->
+        <section id="tab-telemetry" class="space-y-6">
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <!-- CPU -->
+                <div class="bg-slate-900 border border-slate-800 rounded-lg p-4 glow-border">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><i data-lucide="cpu" class="w-4 h-4 text-cyan-400"></i> CPU Load</span>
+                        <span id="cpu-cores" class="text-[10px] px-1.5 py-0.5 rounded bg-slate-950 text-slate-400">4 Cores</span>
+                    </div>
+                    <div class="flex items-baseline space-x-2">
+                        <span id="cpu-percent" class="text-2xl font-bold text-slate-100">0%</span>
+                        <span id="cpu-model" class="text-[10px] text-slate-500 truncate max-w-[140px]">Intel Xeon</span>
+                    </div>
+                    <div class="w-full bg-slate-950 h-2 rounded-full mt-3 overflow-hidden border border-slate-800">
+                        <div id="cpu-bar" class="bg-cyan-400 h-full rounded-full transition-all duration-500" style="width: 5%"></div>
+                    </div>
+                    <p class="text-[10px] text-slate-500 mt-2">Load Avg: <span id="cpu-loadavg" class="text-slate-300">0.05, 0.14, 0.08</span></p>
+                </div>
+
+                <!-- Memory -->
+                <div class="bg-slate-900 border border-slate-800 rounded-lg p-4 glow-border">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><i data-lucide="hard-drive" class="w-4 h-4 text-emerald-400"></i> RAM Usage</span>
+                        <span id="ram-percent" class="text-xs font-bold text-emerald-400">12%</span>
+                    </div>
+                    <div class="flex items-baseline space-x-1">
+                        <span id="ram-used" class="text-2xl font-bold text-slate-100">1.9</span>
+                        <span class="text-xs text-slate-400">/ <span id="ram-total">15.25</span> GB</span>
+                    </div>
+                    <div class="w-full bg-slate-950 h-2 rounded-full mt-3 overflow-hidden border border-slate-800">
+                        <div id="ram-bar" class="bg-emerald-400 h-full rounded-full transition-all duration-500" style="width: 12%"></div>
+                    </div>
+                    <p class="text-[10px] text-slate-500 mt-2">Free RAM: <span id="ram-free" class="text-slate-300">13.35 GB</span></p>
+                </div>
+
+                <!-- Disk -->
+                <div class="bg-slate-900 border border-slate-800 rounded-lg p-4 glow-border">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><i data-lucide="database" class="w-4 h-4 text-amber-400"></i> Disk Space (/)</span>
+                        <span id="disk-percent" class="text-xs font-bold text-amber-400">62%</span>
+                    </div>
+                    <div class="flex items-baseline space-x-1">
+                        <span id="disk-used" class="text-2xl font-bold text-slate-100">58.0</span>
+                        <span class="text-xs text-slate-400">/ <span id="disk-total">92.8</span> GB</span>
+                    </div>
+                    <div class="w-full bg-slate-950 h-2 rounded-full mt-3 overflow-hidden border border-slate-800">
+                        <div id="disk-bar" class="bg-amber-400 h-full rounded-full transition-all duration-500" style="width: 62%"></div>
+                    </div>
+                    <p class="text-[10px] text-slate-500 mt-2">Free Disk: <span id="disk-free" class="text-slate-300">34.8 GB</span></p>
+                </div>
+
+                <!-- Kali Binaries -->
+                <div class="bg-slate-900 border border-slate-800 rounded-lg p-4 glow-border">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><i data-lucide="check-circle-2" class="w-4 h-4 text-cyan-400"></i> Kali Binaries</span>
+                        <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-400 font-bold">NATIVE</span>
+                    </div>
+                    <div id="tools-grid" class="grid grid-cols-2 gap-1 text-[10px] mt-2"></div>
+                </div>
+            </div>
+
+            <!-- Sockets Table -->
+            <div class="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
+                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                    <h2 class="text-xs font-bold uppercase tracking-wider text-slate-200 flex items-center gap-2">
+                        <i data-lucide="radio" class="w-4 h-4 text-cyan-400"></i> Active Kernel Listening Sockets
+                    </h2>
+                    <span id="socket-count" class="text-[10px] bg-slate-950 text-cyan-400 px-2 py-0.5 rounded border border-slate-800 font-bold">10 Sockets</span>
+                </div>
+                <div class="overflow-x-auto custom-scroll max-h-72">
+                    <table class="w-full text-left text-xs text-slate-300">
+                        <thead class="bg-slate-950 text-[10px] uppercase text-slate-400 border-b border-slate-800 sticky top-0">
+                            <tr>
+                                <th class="py-2.5 px-4">Protocol</th>
+                                <th class="py-2.5 px-4">Local Address</th>
+                                <th class="py-2.5 px-4">Port</th>
+                                <th class="py-2.5 px-4">Common Service</th>
+                                <th class="py-2.5 px-4">State</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sockets-body" class="divide-y divide-slate-800 font-mono">
+                            <tr><td colspan="5" class="py-4 text-center text-slate-500">Loading socket telemetry...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB 2: PORT SCANNER -->
+        <section id="tab-scanner" class="hidden space-y-4">
+            <div class="bg-slate-900 border border-slate-800 rounded-lg p-5">
+                <h2 class="text-sm font-bold text-slate-100 uppercase tracking-wider mb-4 flex items-center gap-2">
+                    <i data-lucide="radar" class="w-4 h-4 text-cyan-400"></i> TCP Port Scanner
+                </h2>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                    <div>
+                        <label class="block text-[11px] text-slate-400 uppercase mb-1">Target Host / IP</label>
+                        <input id="scan-target" type="text" value="127.0.0.1" class="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-cyan-400">
+                    </div>
+                    <div>
+                        <label class="block text-[11px] text-slate-400 uppercase mb-1">Ports to Scan</label>
+                        <input id="scan-ports" type="text" value="22, 80, 443, 1883, 3389, 5432, 8000, 9090, 9091, 9392" class="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-cyan-400">
+                    </div>
+                    <div class="flex items-end">
+                        <button onclick="runPortScan()" id="btn-scan" class="w-full bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-bold py-2 px-4 rounded text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition">
+                            <i data-lucide="play" class="w-3.5 h-3.5"></i> Launch Scan
+                        </button>
+                    </div>
+                </div>
+                <div id="scan-results-box" class="hidden mt-4 border-t border-slate-800 pt-4">
+                    <table class="w-full text-left text-xs">
+                        <thead class="bg-slate-950 text-[10px] uppercase text-slate-400">
+                            <tr><th class="p-2">Port</th><th class="p-2">Service</th><th class="p-2">Status</th><th class="p-2">Response Time</th></tr>
+                        </thead>
+                        <tbody id="scan-results-tbody" class="divide-y divide-slate-800 font-mono"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB 3: DIAGNOSTIC TERMINAL -->
+        <section id="tab-terminal" class="hidden space-y-4">
+            <div class="bg-slate-900 border border-slate-800 rounded-lg p-5">
+                <h2 class="text-sm font-bold text-slate-100 uppercase tracking-wider mb-2 flex items-center gap-2">
+                    <i data-lucide="terminal" class="w-4 h-4 text-emerald-400"></i> Kali Host Command Execution
+                </h2>
+                <div class="flex flex-wrap gap-2 mb-3">
+                    <button onclick="setCmd('uname -a && uptime')" class="text-[10px] bg-slate-950 hover:bg-slate-800 text-cyan-300 border border-slate-800 px-2 py-1 rounded">System Info</button>
+                    <button onclick="setCmd('ip -br a && ip route')" class="text-[10px] bg-slate-950 hover:bg-slate-800 text-cyan-300 border border-slate-800 px-2 py-1 rounded">IP & Routes</button>
+                    <button onclick="setCmd('free -h && df -h /')" class="text-[10px] bg-slate-950 hover:bg-slate-800 text-cyan-300 border border-slate-800 px-2 py-1 rounded">RAM & Disk</button>
+                    <button onclick="setCmd('ss -tulpn')" class="text-[10px] bg-slate-950 hover:bg-slate-800 text-cyan-300 border border-slate-800 px-2 py-1 rounded">Listening Ports</button>
+                </div>
+                <div class="flex gap-2">
+                    <input id="term-cmd" type="text" value="uname -a && uptime" class="flex-1 bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-emerald-300 font-mono focus:outline-none focus:border-emerald-400">
+                    <button onclick="runCommand()" id="btn-exec" class="bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold px-5 py-2 rounded text-xs uppercase tracking-wider flex items-center gap-1.5 transition">
+                        <i data-lucide="play" class="w-3.5 h-3.5"></i> Run
+                    </button>
+                </div>
+                <div class="mt-4 bg-[#030712] border border-slate-800 rounded-lg p-4 font-mono text-xs text-emerald-400 overflow-x-auto min-h-[160px] custom-scroll">
+                    <div class="text-slate-500 mb-1">$ <span id="term-echo-cmd">uname -a && uptime</span></div>
+                    <pre id="term-output" class="whitespace-pre-wrap leading-relaxed">Press 'Run' or click a preset above.</pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB 4: WEB SECURITY INSPECTOR -->
+        <section id="tab-webscan" class="hidden space-y-4">
+            <div class="bg-slate-900 border border-slate-800 rounded-lg p-5">
+                <h2 class="text-sm font-bold text-slate-100 uppercase tracking-wider mb-2 flex items-center gap-2">
+                    <i data-lucide="shield-check" class="w-4 h-4 text-cyan-400"></i> HTTP Security Headers & TLS Inspector
+                </h2>
+                <div class="flex gap-2 mb-4">
+                    <input id="web-url" type="text" value="https://google.com" class="flex-1 bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-cyan-400">
+                    <button onclick="runWebScan()" id="btn-webscan" class="bg-cyan-600 hover:bg-cyan-500 text-slate-950 font-bold px-5 py-2 rounded text-xs uppercase tracking-wider flex items-center gap-1.5 transition">
+                        <i data-lucide="search" class="w-3.5 h-3.5"></i> Inspect
+                    </button>
+                </div>
+                <div id="web-results" class="hidden space-y-3">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div class="bg-slate-950 p-3 rounded border border-slate-800">
+                            <span class="text-[10px] text-slate-500 block uppercase">Status Code</span>
+                            <span id="web-status" class="text-lg font-bold text-emerald-400">200 OK</span>
+                        </div>
+                        <div class="bg-slate-950 p-3 rounded border border-slate-800">
+                            <span class="text-[10px] text-slate-500 block uppercase">Missing Headers</span>
+                            <span id="web-missing-count" class="text-lg font-bold text-rose-400">0</span>
+                        </div>
+                        <div class="bg-slate-950 p-3 rounded border border-slate-800">
+                            <span class="text-[10px] text-slate-500 block uppercase">Server Header</span>
+                            <span id="web-server" class="text-sm font-bold text-slate-200 truncate block">gunicorn</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="border-t border-slate-800 bg-slate-950/80 py-3 text-center text-xs text-slate-500">
+        Kali CyberLab Operations Suite &bull; Real Host Telemetry Engine &bull; Port: <span id="current-port">9091</span>
+    </footer>
+
+    <script>
+        const SERVICE_PORTS = { 22: 'SSH', 80: 'HTTP', 443: 'HTTPS', 1883: 'MQTT', 3389: 'RDP', 5432: 'PostgreSQL', 8000: 'Django', 9090: 'Flask', 9091: 'Flask', 9392: 'OpenVAS/GVM' };
+        const API_BASE = window.location.origin;
+        document.getElementById('current-port').innerText = window.location.port || '80';
+
+        function switchTab(tabId) {
+            ['telemetry', 'scanner', 'terminal', 'webscan'].forEach(t => {
+                document.getElementById('tab-' + t).classList.add('hidden');
+                document.getElementById('tab-btn-' + t).className = "px-4 py-2.5 text-xs font-bold uppercase tracking-wider text-slate-400 hover:text-slate-200 border-b-2 border-transparent flex items-center gap-2";
+            });
+            document.getElementById('tab-' + tabId).classList.remove('hidden');
+            document.getElementById('tab-btn-' + tabId).className = "px-4 py-2.5 text-xs font-bold uppercase tracking-wider text-cyan-400 border-b-2 border-cyan-400 flex items-center gap-2";
+            lucide.createIcons();
+        }
+
+        async function fetchTelemetry() {
+            try {
+                const res = await fetch(`${API_BASE}/api/system/health`);
+                const data = await res.json();
+                document.getElementById('hdr-hostname').innerText = data.hostname || 'cuvuln';
+                document.getElementById('hdr-pyver').innerText = `Python ${data.pythonVersion || '3'}`;
+                
+                const cpuLoad = data.cpu.loadPercent || 0;
+                document.getElementById('cpu-percent').innerText = `${cpuLoad.toFixed(1)}%`;
+                document.getElementById('cpu-cores').innerText = `${data.cpu.cores} Cores`;
+                document.getElementById('cpu-model').innerText = data.cpu.model || 'Linux CPU';
+                document.getElementById('cpu-bar').style.width = `${Math.min(100, Math.max(5, cpuLoad))}%`;
+                document.getElementById('cpu-loadavg').innerText = (data.cpu.loadAvg || []).join(', ');
+
+                document.getElementById('ram-used').innerText = (data.memory.usedGB || 0).toFixed(2);
+                document.getElementById('ram-total').innerText = (data.memory.totalGB || 0).toFixed(2);
+                document.getElementById('ram-free').innerText = `${(data.memory.freeGB || 0).toFixed(2)} GB`;
+                document.getElementById('ram-percent').innerText = `${(data.memory.usedPercent || 0).toFixed(1)}%`;
+                document.getElementById('ram-bar').style.width = `${data.memory.usedPercent || 0}%`;
+
+                document.getElementById('disk-used').innerText = (data.disk.usedGB || 0).toFixed(1);
+                document.getElementById('disk-total').innerText = (data.disk.totalGB || 0).toFixed(1);
+                document.getElementById('disk-free').innerText = `${(data.disk.freeGB || 0).toFixed(1)} GB`;
+                document.getElementById('disk-percent').innerText = `${(data.disk.usedPercent || 0).toFixed(1)}%`;
+                document.getElementById('disk-bar').style.width = `${data.disk.usedPercent || 0}%`;
+
+                const toolsGrid = document.getElementById('tools-grid');
+                toolsGrid.innerHTML = '';
+                Object.entries(data.installedTools || {}).forEach(([tool, installed]) => {
+                    const el = document.createElement('div');
+                    el.className = `flex items-center justify-between p-1 rounded bg-slate-950 border ${installed ? 'border-emerald-500/30 text-emerald-300' : 'border-slate-800 text-slate-500'}`;
+                    el.innerHTML = `<span>${tool}</span><span class="${installed ? 'text-emerald-400' : 'text-rose-500'} font-bold">${installed ? '✓' : '✗'}</span>`;
+                    toolsGrid.appendChild(el);
+                });
+
+                const sockets = data.sockets || [];
+                document.getElementById('socket-count').innerText = `${sockets.length} Sockets`;
+                const tbody = document.getElementById('sockets-body');
+                tbody.innerHTML = '';
+                sockets.forEach(s => {
+                    const row = document.createElement('tr');
+                    row.className = "hover:bg-slate-800/50 transition";
+                    row.innerHTML = `
+                        <td class="py-2 px-4 text-cyan-400 font-bold uppercase">${s.protocol}</td>
+                        <td class="py-2 px-4 text-slate-200">${s.localAddress}</td>
+                        <td class="py-2 px-4 text-emerald-400 font-bold">${s.port}</td>
+                        <td class="py-2 px-4 text-slate-400">${SERVICE_PORTS[parseInt(s.port, 10)] || 'Custom'}</td>
+                        <td class="py-2 px-4"><span class="px-1.5 py-0.5 text-[9px] rounded bg-emerald-950 border border-emerald-500/40 text-emerald-300 font-bold">${s.state}</span></td>
+                    `;
+                    tbody.appendChild(row);
+                });
+            } catch (err) { console.error(err); }
+        }
+
+        async function runPortScan() {
+            const target = document.getElementById('scan-target').value;
+            const ports = document.getElementById('scan-ports').value.split(',').map(p => parseInt(p.trim())).filter(p => !isNaN(p));
+            const res = await fetch(`${API_BASE}/api/scan/network`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target, ports })
+            });
+            const data = await res.json();
+            document.getElementById('scan-results-box').classList.remove('hidden');
+            const tbody = document.getElementById('scan-results-tbody');
+            tbody.innerHTML = '';
+            (data.results || []).forEach(r => {
+                const row = document.createElement('tr');
+                const isOpen = r.state === 'OPEN';
+                row.className = isOpen ? "bg-emerald-950/20" : "";
+                row.innerHTML = `
+                    <td class="p-2 font-bold ${isOpen ? 'text-emerald-400' : 'text-slate-400'}">${r.port}</td>
+                    <td class="p-2 text-slate-300">${r.service || 'Unknown'}</td>
+                    <td class="p-2"><span class="px-2 py-0.5 rounded text-[10px] font-bold ${isOpen ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-slate-800 text-slate-500'}">${r.state}</span></td>
+                    <td class="p-2 text-slate-400">${r.latencyMs || 0} ms</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        function setCmd(cmd) { document.getElementById('term-cmd').value = cmd; runCommand(); }
+
+        async function runCommand() {
+            const cmd = document.getElementById('term-cmd').value;
+            document.getElementById('term-echo-cmd').innerText = cmd;
+            document.getElementById('term-output').innerText = "Running...";
+            const res = await fetch(`${API_BASE}/api/terminal/execute`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ command: cmd })
+            });
+            const data = await res.json();
+            document.getElementById('term-output').innerText = data.output || `(Exit Code: ${data.exitCode})`;
+        }
+
+        async function runWebScan() {
+            const url = document.getElementById('web-url').value;
+            const res = await fetch(`${API_BASE}/api/scan/web`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url })
+            });
+            const data = await res.json();
+            document.getElementById('web-results').classList.remove('hidden');
+            document.getElementById('web-status').innerText = data.statusCode || '200 OK';
+            document.getElementById('web-missing-count').innerText = (data.securityMissing || []).length;
+            document.getElementById('web-server').innerText = (data.headers && (data.headers['Server'] || data.headers['server'])) || 'N/A';
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            lucide.createIcons();
+            fetchTelemetry();
+            setInterval(fetchTelemetry, 3000);
+        });
+    </script>
+</body>
+</html>
