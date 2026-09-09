@@ -25,6 +25,8 @@ import { PythonEngineViewer } from "./components/PythonEngineViewer";
 import { ScanHistoryDrawer } from "./components/ScanHistoryDrawer";
 import { SecurityToolsHub } from "./components/SecurityToolsHub";
 import { SecurityArsenal } from "./components/SecurityArsenal";
+import { ObserviumDashboard } from "./components/ObserviumDashboard";
+import { ObserviumDashboard } from "./components/ObserviumDashboard";
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>("network");
   
@@ -402,13 +404,24 @@ export default function App() {
           <KaliMigrationGuide />
         )}
 
-        {activeTab === "arsenal" && (
-        <SecurityArsenal
-        onLaunch={(url) => {
-        window.open(url, "_blank", "noopener,noreferrer");
-        }}
-        />
-        )}
+       {activeTab === "arsenal" && (
+  <SecurityArsenal
+    onLaunch={(url) => {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }}
+    onOpenObservium={() => {
+      setActiveTab("observium");
+    }}
+  />
+)}
+
+{activeTab === "observium" && (
+  <ObserviumDashboard
+    onBack={() => {
+      setActiveTab("arsenal");
+    }}
+  />
+)}
     
         {activeTab === "tools" && (
           <SecurityToolsHub />

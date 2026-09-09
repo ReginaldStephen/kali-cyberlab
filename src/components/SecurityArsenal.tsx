@@ -19,6 +19,7 @@ import {
 
 interface SecurityArsenalProps {
   onLaunch: (url: string) => void;
+  onOpenObservium: () => void;
 }
 
 interface IntegrationStatus {
@@ -208,6 +209,7 @@ const statusConfig = {
 
 export const SecurityArsenal: React.FC<SecurityArsenalProps> = ({
   onLaunch,
+  onOpenObservium,
 }) => {
     const [integrationStatuses, setIntegrationStatuses] =
     useState<Record<string, IntegrationStatus>>({});
@@ -1278,7 +1280,11 @@ const loadGreenboneReport = useCallback(
             <div className="mt-4 grid grid-cols-[1fr_auto] gap-2">
 
               <button
-                onClick={() => handleLaunch(tool)}
+                onClick={() =>
+                  tool.id === "observium"
+                    ? onOpenObservium()
+                    : handleLaunch(tool)
+                }
                 className="flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-white transition-colors hover:bg-emerald-500"
               >
                 <ExternalLink className="h-3.5 w-3.5" />

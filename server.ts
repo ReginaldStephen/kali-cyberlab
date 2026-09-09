@@ -6,6 +6,7 @@ import { exec } from "child_process";
 import http from "http";
 import https from "https";
 import tls from "tls";
+import mysql from "mysql2/promise";
 import net from "net";
 import { GoogleGenAI } from "@google/genai";
 import { createServer as createViteServer } from "vite";
@@ -32,6 +33,21 @@ app.use(express.json({ limit: "2mb" }));
 // ============================================================
 
 const scanHistory: ScanRunRecord[] = [];
+
+// ============================================================
+// OBSERVIUM DATABASE CLIENT
+// ============================================================
+
+const observiumDb = mysql.createPool({
+  host: process.env.OBSERVIUM_DB_HOST || "127.0.0.1",
+  port: Number(process.env.OBSERVIUM_DB_PORT) || 3306,
+  database: process.env.OBSERVIUM_DB_NAME || "observium",
+  user: process.env.OBSERVIUM_DB_USER || "observium",
+  password: process.env.OBSERVIUM_DB_PASSWORD || "",
+  waitForConnections: true,
+  connectionLimit: 5,
+  queueLimit: 0,
+});
 
 // ============================================================
 // GREENBONE GMP CLIENT
@@ -697,6 +713,279 @@ function countVulnerabilities(findings: VulnerabilityFinding[]) {
     info: findings.filter((v) => v.severity === "info").length,
   };
 }
+
+// ============================================================
+// OBSERVIUM DEVICES API
+// ============================================================
+
+app.get("/api/integrations/observium/devices", async (_req, res) => {
+  try {
+    const [rows] = await observiumDb.query(`
+      SELECT
+        device_id,
+        hostname,
+        sysName,
+        label,
+        ip,
+        os,
+        vendor,
+        hardware,
+        location,
+        status,
+        status_type,
+        disabled,
+        last_polled,
+        last_discovered
+      FROM devices
+      ORDER BY device_id ASC
+    `);
+
+    return res.json({
+      timestamp: new Date().toISOString(),
+      devices: rows,
+    });
+  } catch (err: any) {
+    console.error("Observium devices query failed:", err);
+
+    return res.status(500).json({
+      error:
+        err?.message ||
+        "Unable to retrieve devices from Observium.",
+    });
+  }
+});
+
+// ============================================================
+// OBSERVIUM DEVICE SEARCH
+// ============================================================
+
+app.get(
+  "/api/integrations/observium/devices/search",
+  async (req, res) => {
+    try {
+      const rawQuery =
+        typeof req.query.q === "string"
+          ? req.query.q.trim()
+          : "";
+
+      if (!rawQuery) {
+        return res.json({
+          timestamp: new Date().toISOString(),
+          query: "",
+          devices: [],
+        });
+      }
+
+      const searchTerm = `%${rawQuery}%`;
+
+      const [rows] = await observiumDb.execute(
+        `
+        SELECT
+          device_id,
+          hostname,
+          sysName,
+          label,
+          ip,
+          os,
+          vendor,
+          hardware,
+          location,
+          status,
+          status_type,
+          disabled,
+          last_polled,
+          last_discovered
+        FROM devices
+        WHERE
+          hostname LIKE ?
+          OR sysName LIKE ?
+          OR label LIKE ?
+          OR ip LIKE ?
+          OR os LIKE ?
+          OR vendor LIKE ?
+          OR hardware LIKE ?
+          OR location LIKE ?
+        ORDER BY device_id ASC
+        LIMIT 50
+        `,
+        [
+          searchTerm,
+          searchTerm,
+          searchTerm,
+          searchTerm,
+          searchTerm,
+          searchTerm,
+          searchTerm,
+          searchTerm,
+        ]
+      );
+
+      return res.json({
+        timestamp: new Date().toISOString(),
+        query: rawQuery,
+        devices: rows,
+      });
+    } catch (err: any) {
+      console.error("Observium device search failed:", err);
+
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Unable to search Observium devices.",
+      });
+    }
+  }
+);
+
+// ============================================================
+// OBSERVIUM DEVICE DETAILS
+// ============================================================
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId",
+  async (req, res) => {
+    try {
+      const deviceId = Number(req.params.deviceId);
+
+      if (!Number.isInteger(deviceId) || deviceId <= 0) {
+        return res.status(400).json({
+          error: "Invalid Observium device ID.",
+        });
+      }
+
+      const [deviceRows] = await observiumDb.execute(
+        `
+        SELECT
+          device_id,
+          hostname,
+          sysName,
+          label,
+          ip,
+          os,
+          vendor,
+          hardware,
+          location,
+          status,
+          status_type,
+          disabled,
+          last_polled,
+          last_discovered
+        FROM devices
+        WHERE device_id = ?
+        LIMIT 1
+        `,
+        [deviceId]
+      );
+
+      const devices = deviceRows as any[];
+
+      if (devices.length === 0) {
+        return res.status(404).json({
+          error: "Observium device not found.",
+        });
+      }
+
+      const device = devices[0];
+
+      const [portRows] = await observiumDb.execute(
+        `
+        SELECT
+          port_id,
+          device_id,
+          port_label,
+          ifDescr,
+          ifName,
+          ifIndex,
+          ifSpeed,
+          ifHighSpeed,
+          ifOperStatus,
+          ifAdminStatus,
+          ifDuplex,
+          ifMtu,
+          ifType,
+          ifAlias,
+          ifPhysAddress,
+          ifInOctets,
+          ifOutOctets,
+          ifInErrors,
+          ifOutErrors,
+        poll_time,
+        poll_period
+        FROM ports
+        WHERE device_id = ?
+          AND deleted = 0
+        ORDER BY ifIndex ASC
+        `,
+        [deviceId]
+      );
+
+      const [processorRows] = await observiumDb.execute(
+        `
+        SELECT *
+        FROM processors
+        WHERE device_id = ?
+        ORDER BY processor_id ASC
+        `,
+        [deviceId]
+      );
+
+      const [memoryRows] = await observiumDb.execute(
+        `
+        SELECT *
+        FROM mempools
+        WHERE device_id = ?
+        ORDER BY mempool_id ASC
+        `,
+        [deviceId]
+      );
+
+      const [storageRows] = await observiumDb.execute(
+        `
+        SELECT *
+        FROM storage
+        WHERE device_id = ?
+        ORDER BY storage_id ASC
+        `,
+        [deviceId]
+      );
+
+      const [sensorRows] = await observiumDb.execute(
+        `
+        SELECT *
+        FROM sensors
+        WHERE device_id = ?
+          AND sensor_deleted = 0
+        ORDER BY sensor_id ASC
+        `,
+        [deviceId]
+      );
+
+      return res.json({
+        timestamp: new Date().toISOString(),
+
+        device,
+
+        ports: portRows,
+
+        processors: processorRows,
+
+        memory: memoryRows,
+
+        storage: storageRows,
+
+        sensors: sensorRows,
+      });
+    } catch (err: any) {
+      console.error("Observium device details query failed:", err);
+
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium device details.",
+      });
+    }
+  }
+);
 
 // ============================================================
 // 1. SYSTEM HEALTH
