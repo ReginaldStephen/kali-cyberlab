@@ -512,15 +512,11 @@ export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
           </div>
 
           <div className="mt-2 font-mono text-2xl font-bold text-sky-400">
-            {isLoading
-              ? "…"
-              : devices.length === 0
-                ? 0
-                : "—"}
+            {isLoading ? "…" : deviceDetails ? deviceDetails.ports.length : "—"}
           </div>
 
           <div className="mt-1 text-[9px] uppercase tracking-wider text-slate-600">
-            Select a device for interface data
+            Interfaces on selected device
           </div>
         </div>
       </div>

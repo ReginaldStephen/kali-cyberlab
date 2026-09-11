@@ -26,7 +26,6 @@ import { ScanHistoryDrawer } from "./components/ScanHistoryDrawer";
 import { SecurityToolsHub } from "./components/SecurityToolsHub";
 import { SecurityArsenal } from "./components/SecurityArsenal";
 import { ObserviumDashboard } from "./components/ObserviumDashboard";
-import { ObserviumDashboard } from "./components/ObserviumDashboard";
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>("network");
   
