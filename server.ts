@@ -1,4 +1,22 @@
+import { evaluateCyberLabAlert } from "./src/server/alertRules";
+import {
+  processCyberLabEvent,
+  getCyberLabAlerts,
+  getCyberLabAlertStats,
+  updateCyberLabAlertStatus,
+} from "./src/server/alertEngine";
 import "dotenv/config";
+import {
+  startTelegramCommandListener,
+  registerTelegramScanHistoryProvider,
+  registerTelegramGreenboneTaskProvider,
+  registerTelegramGreenboneScanProvider,
+} from "./src/server/telegramCommands";
+import {
+  generateCyberLabAIResponse,
+  registerCyberLabAIClientProvider,
+  registerCyberLabLiveContextProvider,
+} from "./src/server/ai";
 import express from "express";
 import path from "path";
 import os from "os";
@@ -10,6 +28,7 @@ import mysql from "mysql2/promise";
 import net from "net";
 import { GoogleGenAI } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import { XMLParser } from "fast-xml-parser";
 
 import {
   SystemHealth,
@@ -17,11 +36,23 @@ import {
   DiscoveredPort,
   WebAuditResult,
   VulnerabilityFinding,
+  CyberLabEvent,
   ScanRunRecord,
   RemediationReport,
   IndividualScanReport,
   TerminalExecutionResponse,
 } from "./src/types";
+
+import {
+  authenticate,
+  createSession,
+  destroySession,
+  requireAuthentication,
+  requirePermission,
+  verifyPassword,
+  clearSessionCookie,
+  auditLog,
+} from "./src/server/auth";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -29,10 +60,491 @@ const PORT = Number(process.env.PORT) || 3000;
 app.use(express.json({ limit: "2mb" }));
 
 // ============================================================
+// CYBERLAB DATABASE CLIENT
+// ============================================================
+
+const cyberlabDb = mysql.createPool({
+  host: process.env.CYBERLAB_DB_HOST || "127.0.0.1",
+  port: Number(process.env.CYBERLAB_DB_PORT) || 3306,
+  database: process.env.CYBERLAB_DB_NAME || "cyberlab",
+  user: process.env.CYBERLAB_DB_USER || "cyberlab_app",
+  password: process.env.CYBERLAB_DB_PASSWORD || "",
+  waitForConnections: true,
+  connectionLimit: 5,
+  queueLimit: 0,
+});
+
+// ============================================================
 // GLOBAL STATE
 // ============================================================
 
 const scanHistory: ScanRunRecord[] = [];
+
+const cyberLabEvents: CyberLabEvent[] = [];
+
+function recordCyberLabEvent(
+  event: Omit<CyberLabEvent, "id" | "timestamp">
+): CyberLabEvent {
+  const alertDecision = evaluateCyberLabAlert(
+    event.severity
+  );
+
+  const recordedEvent: CyberLabEvent = {
+    id: `event-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    ...event,
+    metadata: {
+      ...(event.metadata || {}),
+      alert: alertDecision,
+    },
+  };
+
+  cyberLabEvents.unshift(recordedEvent);
+
+  // Keep the event history bounded so memory usage stays predictable.
+  if (cyberLabEvents.length > 200) {
+    cyberLabEvents.pop();
+  }
+
+  console.log(
+    `[CyberLab Event] ${recordedEvent.severity.toUpperCase()} | ` +
+      `${recordedEvent.source} | ` +
+      `${recordedEvent.type} | ` +
+      recordedEvent.title
+  );
+
+  processCyberLabEvent(recordedEvent);
+
+  return recordedEvent;
+}
+
+// ============================================================
+// GREENBONE PROACTIVE ALERT MONITOR
+// ============================================================
+
+type GreenboneMonitorTask = {
+  id: string;
+  name: string;
+  status: string;
+  progress: number;
+  reportId: string | null;
+};
+
+const greenbonePreviousTaskStates =
+  new Map<string, string>();
+
+let greenboneMonitorStarted = false;
+let greenboneMonitorTimer:
+  ReturnType<typeof setInterval> | null = null;
+
+function normalizeGreenboneStatus(
+  status: string
+): string {
+  return status.trim().toLowerCase();
+}
+
+function parseGreenboneReportFindings(
+  xml: string
+) {
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "@_",
+    trimValues: true,
+  });
+
+  const parsed = parser.parse(xml || "");
+
+  const report =
+    parsed?.get_reports_response?.report ||
+    parsed?.get_report_response?.report ||
+    null;
+
+  if (!report) {
+    return {
+      critical: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+      total: 0,
+    };
+  }
+
+  const rawResults =
+    report?.results?.result ||
+    [];
+
+  const results = Array.isArray(rawResults)
+    ? rawResults
+    : [rawResults];
+
+  const counts = {
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+    total: 0,
+  };
+
+  for (const result of results) {
+    if (!result || typeof result !== "object") {
+      continue;
+    }
+
+    const severityValue =
+      result?.severity;
+
+    const severity =
+      typeof severityValue === "string"
+        ? Number.parseFloat(severityValue)
+        : Number(severityValue);
+
+    if (!Number.isFinite(severity)) {
+      continue;
+    }
+
+    counts.total += 1;
+
+    if (severity >= 9.0) {
+      counts.critical += 1;
+    } else if (severity >= 7.0) {
+      counts.high += 1;
+    } else if (severity >= 4.0) {
+      counts.medium += 1;
+    } else {
+      counts.low += 1;
+    }
+  }
+
+  return counts;
+}
+
+async function getGreenboneMonitorTasks():
+  Promise<GreenboneMonitorTask[]> {
+  const result =
+    await runGreenboneGmpCommand(
+      "<get_tasks/>"
+    );
+
+  if (
+    result.statusCode < 200 ||
+    result.statusCode >= 300
+  ) {
+    throw new Error(
+      result.statusText ||
+      "Greenbone task request failed."
+    );
+  }
+
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "@_",
+    trimValues: true,
+  });
+
+  const parsedXml =
+    parser.parse(result.xml || "");
+
+  const response =
+    parsedXml?.get_tasks_response || {};
+
+  const rawTasks =
+    response.task || [];
+
+  const taskList =
+    Array.isArray(rawTasks)
+      ? rawTasks
+      : [rawTasks];
+
+  const getText = (
+    value: unknown
+  ): string | null => {
+    if (
+      value === null ||
+      value === undefined
+    ) {
+      return null;
+    }
+
+    if (
+      typeof value === "string" ||
+      typeof value === "number"
+    ) {
+      return String(value).trim();
+    }
+
+    return null;
+  };
+
+  return taskList
+    .map((task: any) => {
+      const report =
+        task?.last_report?.report ||
+        task?.current_report?.report ||
+        null;
+
+      const status =
+        getText(task?.status) ||
+        "Unknown";
+
+      const progressText =
+        getText(task?.progress);
+
+      const rawProgress =
+        progressText !== null &&
+        progressText !== ""
+          ? Number.parseInt(
+              progressText,
+              10
+            )
+          : 0;
+
+      const progress =
+        normalizeGreenboneStatus(status) ===
+          "done" &&
+        rawProgress < 0
+          ? 100
+          : Number.isNaN(rawProgress)
+            ? 0
+            : rawProgress;
+
+      return {
+        id:
+          getText(task?.["@_id"]) ||
+          "",
+        name:
+          getText(task?.name) ||
+          "Unnamed task",
+        status,
+        progress,
+        reportId:
+          getText(report?.["@_id"]),
+      };
+    })
+    .filter(
+      (task: GreenboneMonitorTask) =>
+        Boolean(task.id)
+    );
+}
+
+async function processGreenboneTaskAlert(
+  task: GreenboneMonitorTask,
+  previousStatus: string
+): Promise<void> {
+  const status =
+    normalizeGreenboneStatus(task.status);
+
+  const previous =
+    normalizeGreenboneStatus(
+      previousStatus
+    );
+
+  if (
+    status === "done" &&
+    previous !== "done"
+  ) {
+    let findings = {
+      critical: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+      total: 0,
+    };
+
+    if (task.reportId) {
+      try {
+        const reportResult =
+          await runGreenboneGmpCommand(
+            `<get_reports report_id="${escapeXml(
+              task.reportId
+            )}" details="1" filter="apply_overrides=0 min_qod=70 first=1 rows=1000"/>`,
+            30000
+          );
+
+        if (
+          reportResult.statusCode >= 200 &&
+          reportResult.statusCode < 300
+        ) {
+          findings =
+            parseGreenboneReportFindings(
+              reportResult.xml || ""
+            );
+        }
+      } catch (error: any) {
+        console.error(
+          "[Greenbone Monitor] Failed to retrieve completed report:",
+          error
+        );
+      }
+    }
+
+    const severity =
+      findings.critical > 0
+        ? "critical"
+        : findings.high > 0
+          ? "high"
+          : findings.medium > 0
+            ? "medium"
+            : findings.low > 0
+              ? "low"
+              : "info";
+
+    const resultSummary =
+      findings.total === 0
+        ? "No vulnerabilities were reported."
+        : `${findings.critical} critical, ` +
+          `${findings.high} high, ` +
+          `${findings.medium} medium, ` +
+          `${findings.low} low finding(s).`;
+
+    recordCyberLabEvent({
+      type: "greenbone.scan.completed",
+      source: "greenbone",
+      severity,
+      title:
+        severity === "critical"
+          ? "Greenbone scan completed with critical findings"
+          : severity === "high"
+            ? "Greenbone scan completed with high findings"
+            : "Greenbone scan completed",
+      message:
+        `Greenbone vulnerability scan "${task.name}" ` +
+        `completed successfully. ${resultSummary}`,
+      target: task.name,
+      metadata: {
+        taskId: task.id,
+        reportId: task.reportId,
+        progress: task.progress,
+        findings,
+      },
+    });
+
+    return;
+  }
+
+  if (
+    [
+      "interrupted",
+      "failed",
+      "stopped",
+    ].includes(status) &&
+    previous !== status
+  ) {
+    recordCyberLabEvent({
+      type:
+        status === "failed"
+          ? "greenbone.scan.failed"
+          : "greenbone.scan.interrupted",
+      source: "greenbone",
+      severity: "high",
+      title:
+        status === "failed"
+          ? "Greenbone scan failed"
+          : "Greenbone scan interrupted",
+      message:
+        `Greenbone vulnerability scan "${task.name}" ` +
+        `did not complete successfully. ` +
+        `Current status: ${task.status}.`,
+      target: task.name,
+      metadata: {
+        taskId: task.id,
+        reportId: task.reportId,
+        progress: task.progress,
+        previousStatus,
+        status: task.status,
+      },
+    });
+  }
+}
+
+async function runGreenboneAlertMonitor(): Promise<void> {
+  try {
+    const tasks =
+      await getGreenboneMonitorTasks();
+
+    for (const task of tasks) {
+      const previousStatus =
+        greenbonePreviousTaskStates.get(
+          task.id
+        );
+
+      if (previousStatus === undefined) {
+        greenbonePreviousTaskStates.set(
+          task.id,
+          task.status
+        );
+        continue;
+      }
+
+      if (
+        normalizeGreenboneStatus(
+          previousStatus
+        ) !==
+        normalizeGreenboneStatus(
+          task.status
+        )
+      ) {
+        await processGreenboneTaskAlert(
+          task,
+          previousStatus
+        );
+      }
+
+      greenbonePreviousTaskStates.set(
+        task.id,
+        task.status
+      );
+    }
+  } catch (error: any) {
+    console.error(
+      "[Greenbone Monitor] Monitor cycle failed:",
+      error?.message ||
+        error
+    );
+  }
+}
+
+function startGreenboneAlertMonitor(): void {
+  if (greenboneMonitorStarted) {
+    return;
+  }
+
+  greenboneMonitorStarted = true;
+
+  // First pass establishes the existing state without
+  // generating alerts for historical Greenbone tasks.
+  void runGreenboneAlertMonitor();
+
+  greenboneMonitorTimer =
+    setInterval(
+      () => {
+        void runGreenboneAlertMonitor();
+      },
+      15000
+    );
+
+  console.log(
+    "[Greenbone Monitor] Proactive alert monitoring started."
+  );
+}
+
+
+// ============================================================
+// AUTHENTICATION MIDDLEWARE
+// ============================================================
+
+// Resolve the CyberLab session, if one exists.
+// This does NOT require authentication yet.
+app.use((req, res, next) => {
+  authenticate(
+    cyberlabDb,
+    req,
+    res,
+    next
+  ).catch(next);
+});
+
 
 // ============================================================
 // OBSERVIUM DATABASE CLIENT
@@ -441,6 +953,1562 @@ function addScanHistory(record: ScanRunRecord): void {
   }
 }
 
+
+async function getCyberLabLiveContext() {
+  const recentScans = scanHistory.slice(0, 10);
+
+  const recentEvents = cyberLabEvents.slice(0, 20);
+
+  const eventSummary = {
+    totalTracked: cyberLabEvents.length,
+    recentCount: recentEvents.length,
+    critical: recentEvents.filter(
+      (event) => event.severity === "critical"
+    ).length,
+    high: recentEvents.filter(
+      (event) => event.severity === "high"
+    ).length,
+    medium: recentEvents.filter(
+      (event) => event.severity === "medium"
+    ).length,
+    low: recentEvents.filter(
+      (event) => event.severity === "low"
+    ).length,
+    info: recentEvents.filter(
+      (event) => event.severity === "info"
+    ).length,
+  };
+
+  const scanSummary = {
+    totalTracked: scanHistory.length,
+    recentCount: recentScans.length,
+    successful: recentScans.filter(
+      (scan) => scan.status === "success"
+    ).length,
+    failed: recentScans.filter(
+      (scan) => scan.status !== "success"
+    ).length,
+    hostsFound: recentScans.reduce(
+      (total, scan) => total + (scan.hostsFound || 0),
+      0
+    ),
+    openPorts: recentScans.reduce(
+      (total, scan) => total + (scan.openPortsTotal || 0),
+      0
+    ),
+    vulnerabilities: recentScans.reduce(
+      (total, scan) => {
+        const count = scan.vulnerabilitiesCount;
+
+        if (typeof count === "number") {
+          return total + count;
+        }
+
+        if (count && typeof count === "object") {
+          return (
+            total +
+            (count.critical || 0) +
+            (count.high || 0) +
+            (count.medium || 0) +
+            (count.low || 0) +
+            (count.info || 0)
+          );
+        }
+
+        return total;
+      },
+      0
+    ),
+  };
+
+  const context: any = {
+    generatedAt: new Date().toISOString(),
+
+    events: {
+      summary: eventSummary,
+      recent: recentEvents.map((event) => ({
+        id: event.id,
+        timestamp: event.timestamp,
+        type: event.type,
+        source: event.source,
+        severity: event.severity,
+        title: event.title,
+        message: event.message,
+        target: event.target,
+        metadata: event.metadata,
+      })),
+    },
+
+    scans: {
+      summary: scanSummary,
+
+      recent: recentScans.map((scan) => ({
+        id: scan.id,
+        timestamp: scan.timestamp,
+        type: scan.type,
+        target: scan.target,
+        status: scan.status,
+        durationMs: scan.durationMs,
+        hostsFound: scan.hostsFound,
+        openPortsTotal: scan.openPortsTotal,
+        vulnerabilitiesCount:
+          scan.vulnerabilitiesCount,
+      })),
+    },
+
+    greenbone: {
+      status: "unknown",
+      runningTasks: 0,
+      totalTasks: 0,
+      tasks: [],
+    },
+
+    observium: {
+      status: "unknown",
+      totalDevices: 0,
+      onlineDevices: 0,
+      offlineDevices: 0,
+      totalInterfaces: 0,
+      interfacesUp: 0,
+      interfacesDown: 0,
+      interfacesWithErrors: 0,
+      highUtilizationInterfaces: 0,
+      activeAlerts: 0,
+    },
+  };
+
+  // ------------------------------------------------------------
+  // NETWORK SCANNER + WEB AUDITOR LIVE CONTEXT
+  // ------------------------------------------------------------
+
+  const recentNetworkScans =
+    scanHistory
+      .filter(
+        (scan) =>
+          scan.type === "network" ||
+          scan.type === "quick-5s"
+      )
+      .slice(0, 10);
+
+  const recentWebScans =
+    scanHistory
+      .filter(
+        (scan) =>
+          scan.type === "web"
+      )
+      .slice(0, 10);
+
+  const networkHosts = recentNetworkScans.flatMap(
+    (scan: any) =>
+      Array.isArray(scan.results?.hosts)
+        ? scan.results.hosts.map((host: any) => ({
+            scanId: scan.id,
+            timestamp: scan.timestamp,
+            target: scan.target,
+            ip: host.ip,
+            status: host.status,
+            latencyMs: host.latencyMs,
+            lastSeen: host.lastSeen,
+            openPorts: Array.isArray(host.openPorts)
+              ? host.openPorts.map((port: any) => ({
+                  port: port.port,
+                  protocol: port.protocol,
+                  service: port.service,
+                  state: port.state,
+                  banner: port.banner,
+                }))
+              : [],
+          }))
+        : []
+  );
+
+  const networkVulnerabilities = recentNetworkScans.flatMap(
+    (scan: any) =>
+      Array.isArray(scan.results?.vulnerabilities)
+        ? scan.results.vulnerabilities
+        : []
+  );
+
+  const webAudits = recentWebScans.flatMap(
+    (scan: any) => {
+      const audit = scan.results?.webAudit;
+
+      if (!audit) {
+        return [];
+      }
+
+      return [
+        {
+          scanId: scan.id,
+          timestamp: scan.timestamp,
+          url: audit.url,
+          resolvedIp: audit.resolvedIp,
+          statusCode: audit.statusCode,
+          statusText: audit.statusText,
+          responseTimeMs: audit.responseTimeMs,
+          protocol: audit.protocol,
+          securityScore: audit.securityScore,
+          securityGrade: audit.securityGrade,
+          ssl: audit.ssl
+            ? {
+                protocol: audit.ssl.protocol,
+                issuer: audit.ssl.issuer,
+                subject: audit.ssl.subject,
+                validFrom: audit.ssl.validFrom,
+                validTo: audit.ssl.validTo,
+                daysRemaining: audit.ssl.daysRemaining,
+              }
+            : undefined,
+          vulnerabilityCount: Array.isArray(
+            audit.vulnerabilities
+          )
+            ? audit.vulnerabilities.length
+            : 0,
+        },
+      ];
+    }
+  );
+
+  const webVulnerabilities = recentWebScans.flatMap(
+    (scan: any) =>
+      Array.isArray(scan.results?.vulnerabilities)
+        ? scan.results.vulnerabilities
+        : []
+  );
+
+  const countSeverity = (
+    findings: any[]
+  ) => ({
+    critical: findings.filter(
+      (finding) =>
+        String(finding?.severity || "").toLowerCase() ===
+        "critical"
+    ).length,
+
+    high: findings.filter(
+      (finding) =>
+        String(finding?.severity || "").toLowerCase() ===
+        "high"
+    ).length,
+
+    medium: findings.filter(
+      (finding) =>
+        String(finding?.severity || "").toLowerCase() ===
+        "medium"
+    ).length,
+
+    low: findings.filter(
+      (finding) =>
+        String(finding?.severity || "").toLowerCase() ===
+        "low"
+    ).length,
+
+    info: findings.filter(
+      (finding) =>
+        String(finding?.severity || "").toLowerCase() ===
+        "info"
+    ).length,
+  });
+
+  context.network = {
+    status: "online",
+    recentCount:
+      recentNetworkScans.length,
+
+    totalHosts:
+      networkHosts.length,
+
+    totalOpenPorts:
+      networkHosts.reduce(
+        (total: number, host: any) =>
+          total +
+          (Array.isArray(host.openPorts)
+            ? host.openPorts.length
+            : 0),
+        0
+      ),
+
+    totalVulnerabilities:
+      networkVulnerabilities.length,
+
+    vulnerabilitiesBySeverity:
+      countSeverity(
+        networkVulnerabilities
+      ),
+
+    recentScans:
+      recentNetworkScans.map(
+        (scan: any) => ({
+          id: scan.id,
+          timestamp: scan.timestamp,
+          type: scan.type,
+          target: scan.target,
+          status: scan.status,
+          durationMs: scan.durationMs,
+          hostsFound: scan.hostsFound,
+          openPortsTotal:
+            scan.openPortsTotal,
+          vulnerabilitiesCount:
+            scan.vulnerabilitiesCount,
+        })
+      ),
+
+    hosts:
+      networkHosts.slice(0, 25),
+
+    vulnerabilities:
+      networkVulnerabilities.slice(0, 25),
+  };
+
+  context.web = {
+    status: "online",
+    recentCount:
+      recentWebScans.length,
+
+    totalAudits:
+      webAudits.length,
+
+    vulnerabilities:
+      webVulnerabilities.length,
+
+    vulnerabilitiesBySeverity:
+      countSeverity(
+        webVulnerabilities
+      ),
+
+    recentAudits:
+      webAudits.slice(0, 10),
+
+    findings:
+      webVulnerabilities.slice(0, 25),
+  };
+
+  // ------------------------------------------------------------
+  // KALI TERMINAL LIVE CONTEXT
+  // ------------------------------------------------------------
+
+  const recentTerminalCommands =
+    scanHistory
+      .filter(
+        (scan) =>
+          scan.type === "terminal-command"
+      )
+      .slice(0, 15);
+
+  const terminalSuccessful =
+    recentTerminalCommands.filter(
+      (scan) =>
+        scan.status === "success"
+    ).length;
+
+  const terminalFailed =
+    recentTerminalCommands.filter(
+      (scan) =>
+        scan.status !== "success"
+    ).length;
+
+  context.terminal = {
+    status: "online",
+
+    recentCount:
+      recentTerminalCommands.length,
+
+    successful:
+      terminalSuccessful,
+
+    failed:
+      terminalFailed,
+
+    recentExecutions:
+      recentTerminalCommands
+        .slice(0, 15)
+        .map((scan: any) => ({
+          id: scan.id,
+          timestamp:
+            scan.timestamp,
+          command:
+            scan.commandExecuted,
+          target:
+            scan.target,
+          status:
+            scan.status,
+          durationMs:
+            scan.durationMs,
+          output:
+            scan.rawTerminalOutput
+              ? String(
+                  scan.rawTerminalOutput
+                ).slice(0, 2000)
+              : "",
+        })),
+  };
+
+  // ------------------------------------------------------------
+  // VULNERABILITY + REMEDIATION LIVE CONTEXT
+  // ------------------------------------------------------------
+
+  const vulnerabilityScans =
+    recentScans.filter(
+      (scan: any) =>
+        Array.isArray(
+          scan.results?.vulnerabilities
+        ) &&
+        scan.results.vulnerabilities.length >
+          0
+    );
+
+  const allRecentFindings =
+    vulnerabilityScans.flatMap(
+      (scan: any) =>
+        Array.isArray(
+          scan.results?.vulnerabilities
+        )
+          ? scan.results.vulnerabilities.map(
+              (finding: any) => ({
+                ...finding,
+                scanId:
+                  scan.id,
+                scanTimestamp:
+                  scan.timestamp,
+                scanTarget:
+                  scan.target,
+                scanType:
+                  scan.type,
+              })
+            )
+          : []
+    );
+
+  const uniqueFindings =
+    Array.from(
+      new Map(
+        allRecentFindings.map(
+          (finding: any) => [
+            `${finding.title}|${finding.target}`,
+            finding,
+          ]
+        )
+      ).values()
+    );
+
+  const vulnerabilitySeverityCounts =
+    {
+      critical:
+        uniqueFindings.filter(
+          (finding: any) =>
+            String(
+              finding?.severity || ""
+            ).toLowerCase() ===
+            "critical"
+        ).length,
+
+      high:
+        uniqueFindings.filter(
+          (finding: any) =>
+            String(
+              finding?.severity || ""
+            ).toLowerCase() ===
+            "high"
+        ).length,
+
+      medium:
+        uniqueFindings.filter(
+          (finding: any) =>
+            String(
+              finding?.severity || ""
+            ).toLowerCase() ===
+            "medium"
+        ).length,
+
+      low:
+        uniqueFindings.filter(
+          (finding: any) =>
+            String(
+              finding?.severity || ""
+            ).toLowerCase() ===
+            "low"
+        ).length,
+
+      info:
+        uniqueFindings.filter(
+          (finding: any) =>
+            String(
+              finding?.severity || ""
+            ).toLowerCase() ===
+            "info"
+        ).length,
+    };
+
+  const affectedTargets =
+    Array.from(
+      new Set(
+        uniqueFindings
+          .map(
+            (finding: any) =>
+              finding?.target
+          )
+          .filter(Boolean)
+      )
+    );
+
+  const affectedCategories =
+    Array.from(
+      new Set(
+        uniqueFindings
+          .map(
+            (finding: any) =>
+              finding?.category
+          )
+          .filter(Boolean)
+      )
+    );
+
+  const remediationItems =
+    uniqueFindings.map(
+      (finding: any) => ({
+        title:
+          finding?.title ||
+          "Unnamed vulnerability",
+
+        severity:
+          finding?.severity ||
+          "unknown",
+
+        target:
+          finding?.target ||
+          "unknown",
+
+        category:
+          finding?.category ||
+          "unknown",
+
+        description:
+          finding?.description ||
+          "",
+
+        impact:
+          finding?.impact ||
+          "",
+
+        remediationAdvice:
+          finding?.remediationAdvice ||
+          "",
+
+        kaliCommands:
+          Array.isArray(
+            finding?.kaliCommands
+          )
+            ? finding.kaliCommands
+            : [],
+
+        detectedVia:
+          finding?.detectedVia ||
+          "",
+
+        detectedAt:
+          finding?.detectedAt ||
+          null,
+
+        scanId:
+          finding?.scanId ||
+          null,
+
+        scanTimestamp:
+          finding?.scanTimestamp ||
+          null,
+
+        scanType:
+          finding?.scanType ||
+          null,
+      })
+    );
+
+  const highestRiskFinding =
+    uniqueFindings.find(
+      (finding: any) =>
+        String(
+          finding?.severity || ""
+        ).toLowerCase() ===
+        "critical"
+    ) ||
+    uniqueFindings.find(
+      (finding: any) =>
+        String(
+          finding?.severity || ""
+        ).toLowerCase() ===
+        "high"
+    ) ||
+    uniqueFindings.find(
+      (finding: any) =>
+        String(
+          finding?.severity || ""
+        ).toLowerCase() ===
+        "medium"
+    ) ||
+    uniqueFindings.find(
+      (finding: any) =>
+        String(
+          finding?.severity || ""
+        ).toLowerCase() ===
+        "low"
+    ) ||
+    null;
+
+  const remediationRiskLevel =
+    vulnerabilitySeverityCounts.critical >
+    0
+      ? "Critical"
+      : vulnerabilitySeverityCounts.high >
+          0
+        ? "High"
+        : vulnerabilitySeverityCounts.medium >
+            0
+          ? "Medium"
+          : uniqueFindings.length > 0
+            ? "Low"
+            : "Secure";
+
+  const remediationRiskScore =
+    vulnerabilitySeverityCounts.critical >
+    0
+      ? Math.min(
+          100,
+          85 +
+            vulnerabilitySeverityCounts.critical *
+              5
+        )
+      : vulnerabilitySeverityCounts.high >
+          0
+        ? Math.min(
+            84,
+            65 +
+              vulnerabilitySeverityCounts.high *
+                6
+          )
+        : vulnerabilitySeverityCounts.medium >
+            0
+          ? 45
+          : uniqueFindings.length > 0
+            ? 25
+            : 15;
+
+  context.vulnerabilities = {
+    status: "online",
+
+    totalFindings:
+      uniqueFindings.length,
+
+    severity:
+      vulnerabilitySeverityCounts,
+
+    affectedTargets,
+
+    affectedCategories,
+
+    risk: {
+      level:
+        remediationRiskLevel,
+
+      score:
+        remediationRiskScore,
+
+      highestRiskFinding:
+        highestRiskFinding
+          ? {
+              title:
+                highestRiskFinding.title,
+              severity:
+                highestRiskFinding.severity,
+              target:
+                highestRiskFinding.target,
+            }
+          : null,
+    },
+
+    recentFindings:
+      remediationItems.slice(
+        0,
+        25
+      ),
+
+    remediation: {
+      available:
+        uniqueFindings.length >
+        0,
+
+      totalItems:
+        remediationItems.length,
+
+      items:
+        remediationItems
+          .slice(0, 25)
+          .map(
+            (item: any) => ({
+              title:
+                item.title,
+
+              severity:
+                item.severity,
+
+              target:
+                item.target,
+
+              category:
+                item.category,
+
+              action:
+                item.remediationAdvice,
+
+              commands:
+                item.kaliCommands,
+            })
+          ),
+    },
+  };
+
+  // ------------------------------------------------------------
+  // GREENBONE LIVE CONTEXT
+  // ------------------------------------------------------------
+
+  try {
+    const result = await runGreenboneGmpCommand(
+      "<get_tasks/>"
+    );
+
+    if (result.statusCode === 200) {
+      context.greenbone.status = "online";
+    } else {
+      context.greenbone.status = "offline";
+    }
+
+    const xml = result.xml || "";
+
+    const parser = new XMLParser({
+      ignoreAttributes: false,
+      attributeNamePrefix: "@_",
+      trimValues: true,
+    });
+
+    const parsedXml = parser.parse(xml);
+
+    const response =
+      parsedXml?.get_tasks_response || {};
+
+    const rawTasks = response.task || [];
+
+    const taskList = Array.isArray(rawTasks)
+      ? rawTasks
+      : [rawTasks];
+
+    context.greenbone.totalTasks =
+      taskList.length;
+
+    const getText = (
+      value: unknown
+    ): string | null => {
+      if (
+        value === null ||
+        value === undefined
+      ) {
+        return null;
+      }
+
+      if (
+        typeof value === "string" ||
+        typeof value === "number"
+      ) {
+        return String(value).trim();
+      }
+
+      return null;
+    };
+
+    const tasks = taskList.map(
+      (task: any) => {
+        const report =
+          task?.last_report?.report ||
+          task?.current_report?.report ||
+          null;
+
+        const status =
+          getText(task?.status) ||
+          "Unknown";
+
+        const progressText =
+          getText(task?.progress);
+
+        const rawProgress =
+          progressText !== null &&
+          progressText !== ""
+            ? Number.parseInt(
+                progressText,
+                10
+              )
+            : 0;
+
+        const progress =
+          status.toLowerCase() === "done" &&
+          rawProgress < 0
+            ? 100
+            : Number.isNaN(rawProgress)
+              ? 0
+              : rawProgress;
+
+        return {
+          id:
+            getText(task?.["@_id"]) ||
+            "",
+          name:
+            getText(task?.name) ||
+            "Unnamed task",
+          status,
+          progress,
+          reportId:
+            getText(report?.["@_id"]),
+        };
+      }
+    );
+
+    context.greenbone.runningTasks =
+      tasks.filter((task) =>
+        [
+          "Running",
+          "Requested",
+          "Queued",
+          "New",
+        ].includes(task.status)
+      ).length;
+
+    context.greenbone.tasks =
+      tasks.slice(0, 10);
+  } catch (error: any) {
+    context.greenbone.status = "offline";
+    context.greenbone.error =
+      error?.message ||
+      "Unable to retrieve Greenbone tasks.";
+  }
+
+  // ------------------------------------------------------------
+  // OBSERVIUM LIVE CONTEXT
+  // ------------------------------------------------------------
+
+  try {
+    const [deviceRows] =
+      await observiumDb.query(`
+        SELECT
+          COUNT(*) AS total_devices,
+          SUM(
+            CASE
+              WHEN status = 1
+                AND disabled = 0
+              THEN 1
+              ELSE 0
+            END
+          ) AS online_devices,
+          SUM(
+            CASE
+              WHEN status = 0
+                OR disabled = 1
+              THEN 1
+              ELSE 0
+            END
+          ) AS offline_devices
+        FROM devices
+      `);
+
+    const [portRows] =
+      await observiumDb.query(`
+        SELECT
+          COUNT(*) AS total_interfaces,
+          SUM(
+            CASE
+              WHEN ifOperStatus = 'up'
+              THEN 1
+              ELSE 0
+            END
+          ) AS interfaces_up,
+          SUM(
+            CASE
+              WHEN ifOperStatus <> 'up'
+                OR ifOperStatus IS NULL
+              THEN 1
+              ELSE 0
+            END
+          ) AS interfaces_down,
+          SUM(
+            CASE
+              WHEN ifInErrors_rate > 0
+                OR ifOutErrors_rate > 0
+              THEN 1
+              ELSE 0
+            END
+          ) AS interfaces_with_errors,
+          SUM(
+            CASE
+              WHEN ifInOctets_perc >= 80
+                OR ifOutOctets_perc >= 80
+              THEN 1
+              ELSE 0
+            END
+          ) AS high_utilization_interfaces
+        FROM ports
+        WHERE deleted = 0
+          AND disabled = 0
+      `);
+
+    const [alertRows] =
+      await observiumDb.query(`
+        SELECT
+          COUNT(*) AS active_alerts
+        FROM alert_table
+        WHERE alert_status > 0
+      `);
+
+    const devices =
+      (deviceRows as any[])[0] || {};
+
+    const ports =
+      (portRows as any[])[0] || {};
+
+    const alerts =
+      (alertRows as any[])[0] || {};
+
+    context.observium.status = "online";
+
+    context.observium.totalDevices =
+      Number(devices.total_devices || 0);
+
+    context.observium.onlineDevices =
+      Number(devices.online_devices || 0);
+
+    context.observium.offlineDevices =
+      Number(devices.offline_devices || 0);
+
+    context.observium.totalInterfaces =
+      Number(ports.total_interfaces || 0);
+
+    context.observium.interfacesUp =
+      Number(ports.interfaces_up || 0);
+
+    context.observium.interfacesDown =
+      Number(ports.interfaces_down || 0);
+
+    context.observium.interfacesWithErrors =
+      Number(ports.interfaces_with_errors || 0);
+
+    context.observium.highUtilizationInterfaces =
+      Number(
+        ports.high_utilization_interfaces || 0
+      );
+
+    context.observium.activeAlerts =
+      Number(alerts.active_alerts || 0);
+  } catch (error: any) {
+    context.observium.status = "offline";
+    context.observium.error =
+      error?.message ||
+      "Unable to retrieve Observium data.";
+  }
+
+  // ------------------------------------------------------------
+  // SYSTEM HEALTH LIVE CONTEXT
+  // ------------------------------------------------------------
+
+  try {
+    const hostname = os.hostname();
+    const platform = os.platform();
+    const release = os.release();
+    const arch = os.arch();
+
+    const uptimeSeconds = os.uptime();
+
+    const days = Math.floor(
+      uptimeSeconds / 86400
+    );
+
+    const hours = Math.floor(
+      (uptimeSeconds % 86400) / 3600
+    );
+
+    const minutes = Math.floor(
+      (uptimeSeconds % 3600) / 60
+    );
+
+    const uptimeFormatted =
+      `${days > 0 ? `${days}d ` : ""}` +
+      `${hours}h ${minutes}m`;
+
+    const cpus = os.cpus();
+    const cpuModel =
+      cpus[0]?.model ||
+      "Generic CPU";
+
+    const cores = cpus.length;
+    const loadAverage = os.loadavg();
+
+    const cpuUsagePercent =
+      cores > 0
+        ? Math.min(
+            100,
+            Math.round(
+              (loadAverage[0] / cores) * 100
+            )
+          )
+        : 0;
+
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem =
+      totalMem - freeMem;
+
+    const memUsagePercent =
+      totalMem > 0
+        ? Math.round(
+            (usedMem / totalMem) * 100
+          )
+        : 0;
+
+    const ifaces =
+      os.networkInterfaces();
+
+    const interfacesList =
+      Object.entries(ifaces).flatMap(
+        ([name, addrs]) =>
+          (addrs || []).map((addr) => ({
+            name,
+            ip: addr.address,
+            mac: addr.mac,
+            netmask: addr.netmask,
+            family: addr.family,
+            internal: addr.internal,
+          }))
+      );
+
+    const [
+      osReleaseRes,
+      diskRes,
+      socketsRes,
+    ] = await Promise.all([
+      runShellCommand(
+        "cat /etc/os-release 2>/dev/null || uname -a"
+      ),
+      runShellCommand(
+        "df -h / 2>/dev/null || df -h"
+      ),
+      runShellCommand(
+        "ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null || lsof -i -P -n 2>/dev/null"
+      ),
+    ]);
+
+    let distroName: string =
+      platform;
+
+    const prettyNameMatch =
+      osReleaseRes.stdout.match(
+        /PRETTY_NAME="([^"]+)"/
+      );
+
+    if (prettyNameMatch) {
+      distroName =
+        prettyNameMatch[1];
+    } else if (
+      osReleaseRes.stdout
+        .toLowerCase()
+        .includes("kali")
+    ) {
+      distroName =
+        "Kali GNU/Linux";
+    }
+
+    const diskList: SystemHealth["disk"] =
+      [];
+
+    const diskLines =
+      diskRes.stdout
+        .trim()
+        .split("\n")
+        .slice(1);
+
+    for (const line of diskLines) {
+      const parts =
+        line.trim().split(/\s+/);
+
+      if (parts.length >= 6) {
+        diskList.push({
+          filesystem: parts[0],
+          size: parts[1],
+          used: parts[2],
+          avail: parts[3],
+          usePercent: parts[4],
+          mountedOn:
+            parts.slice(5).join(" "),
+        });
+      }
+    }
+
+    const listeningSockets:
+      SystemHealth["listeningSockets"] =
+        [];
+
+    const socketLines =
+      socketsRes.stdout
+        .trim()
+        .split("\n")
+        .slice(1);
+
+    for (const line of socketLines) {
+      const parts =
+        line.trim().split(/\s+/);
+
+      if (parts.length < 5) {
+        continue;
+      }
+
+      const proto = parts[0];
+      const state = parts[1];
+
+      const local =
+        parts[4] ||
+        parts[3] ||
+        "";
+
+      const peer =
+        parts[5] ||
+        parts[4] ||
+        "";
+
+      const lastColon =
+        local.lastIndexOf(":");
+
+      let localAddress =
+        local;
+
+      let localPort:
+        number | string = "";
+
+      if (lastColon !== -1) {
+        localAddress =
+          local.slice(0, lastColon);
+
+        const parsedPort =
+          parseInt(
+            local.slice(
+              lastColon + 1
+            ),
+            10
+          );
+
+        localPort =
+          Number.isNaN(parsedPort)
+            ? local.slice(
+                lastColon + 1
+              )
+            : parsedPort;
+      }
+
+      if (localPort) {
+        listeningSockets.push({
+          protocol: proto,
+          state,
+          localAddress:
+            localAddress || "*",
+          localPort,
+          peerAddress: peer,
+        });
+      }
+    }
+
+    const toolsToCheck = [
+      {
+        name: "Python 3 Kernel Engine",
+        cmd: "python3 --version",
+      },
+      {
+        name: "Nmap Network Scanner",
+        cmd: "nmap --version",
+      },
+      {
+        name: "Ping Utility",
+        cmd:
+          "ping -V 2>&1 || ping -c 1 127.0.0.1",
+      },
+      {
+        name: "Traceroute",
+        cmd:
+          "traceroute --version 2>&1 || tracepath -V",
+      },
+      {
+        name: "cURL HTTP Client",
+        cmd: "curl --version",
+      },
+      {
+        name: "Socket Statistics",
+        cmd: "ss -V",
+      },
+      {
+        name: "Dig DNS Utility",
+        cmd: "dig -v 2>&1",
+      },
+      {
+        name: "Whois",
+        cmd:
+          "whois --version 2>&1",
+      },
+      {
+        name: "UFW Firewall",
+        cmd:
+          "ufw status verbose 2>&1 || ufw --version",
+      },
+      {
+        name: "IPtables",
+        cmd:
+          "iptables --version 2>&1",
+      },
+      {
+        name: "TCPDump Packet Capture",
+        cmd:
+          "tcpdump --version 2>&1",
+      },
+      {
+        name: "Nikto Web Scanner",
+        cmd:
+          "nikto -Version 2>&1",
+      },
+      {
+        name: "Gobuster Directory Scanner",
+        cmd:
+          "gobuster version 2>&1",
+      },
+    ];
+
+    const toolResults =
+      await Promise.all(
+        toolsToCheck.map(
+          async (tool) => {
+            const check =
+              await runShellCommand(
+                tool.cmd,
+                1500
+              );
+
+            const available =
+              check.exitCode === 0 ||
+              check.stdout.trim()
+                .length > 0;
+
+            const output =
+              check.stdout ||
+              check.stderr ||
+              "";
+
+            const firstLine =
+              output
+                .trim()
+                .split("\n")[0] ||
+              "";
+
+            return {
+              name: tool.name,
+              command:
+                tool.cmd.split(" ")[0],
+              available,
+              version:
+                available
+                  ? firstLine.slice(
+                      0,
+                      70
+                    )
+                  : undefined,
+            };
+          }
+        )
+      );
+
+    context.system = {
+      hostname,
+
+      osInfo: {
+        platform,
+        distro:
+          distroName,
+        release,
+        kernel:
+          release,
+        arch,
+      },
+
+      uptimeSeconds,
+      uptimeFormatted,
+
+      cpu: {
+        model:
+          cpuModel,
+        cores,
+        usagePercent:
+          cpuUsagePercent,
+        loadAverage,
+      },
+
+      memory: {
+        totalBytes:
+          totalMem,
+        usedBytes:
+          usedMem,
+        freeBytes:
+          freeMem,
+        usedPercent:
+          memUsagePercent,
+      },
+
+      disk:
+        diskList,
+
+      interfaces:
+        interfacesList,
+
+      listeningSockets:
+        listeningSockets.slice(
+          0,
+          30
+        ),
+
+      toolsInstalled:
+        toolResults,
+
+      timestamp:
+        new Date().toISOString(),
+    };
+  } catch (error: any) {
+    context.system = {
+      status: "offline",
+      error:
+        error?.message ||
+        "Unable to retrieve system health.",
+    };
+  }
+
+  return context;
+}
+
+
+// ============================================================
+// CYBERLAB ALERT API
+// ============================================================
+
+app.get(
+  "/api/ai/alerts",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const requestedLimit = Number(
+        req.query.limit
+      );
+
+      const limit =
+        Number.isFinite(requestedLimit) &&
+        requestedLimit > 0
+          ? Math.min(
+              Math.floor(requestedLimit),
+              200
+            )
+          : 50;
+
+      return res.json({
+        success: true,
+        alerts: getCyberLabAlerts(limit),
+      });
+    } catch (error: any) {
+      console.error(
+        "CyberLab alerts error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Failed to retrieve CyberLab alerts.",
+      });
+    }
+  }
+);
+
+app.patch(
+  "/api/ai/alerts/:alertId",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const { alertId } = req.params;
+      const { status } = req.body || {};
+
+      if (status !== "acknowledged") {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Invalid alert status. Only acknowledged is currently supported.",
+        });
+      }
+
+      const alert = updateCyberLabAlertStatus(
+        alertId,
+        status
+      );
+
+      if (!alert) {
+        return res.status(404).json({
+          success: false,
+          error: "CyberLab alert not found.",
+        });
+      }
+
+      return res.json({
+        success: true,
+        alert,
+      });
+    } catch (error: any) {
+      console.error(
+        "CyberLab alert update error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Failed to update CyberLab alert.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/ai/alerts/stats",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      return res.json({
+        success: true,
+        stats: getCyberLabAlertStats(),
+      });
+    } catch (error: any) {
+      console.error(
+        "CyberLab alert stats error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Failed to retrieve CyberLab alert statistics.",
+      });
+    }
+  }
+);
+
+// TEMPORARY: CyberLab live context inspection endpoint
+app.get(
+  "/api/ai/events",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const requestedLimit = Number(
+        req.query.limit
+      );
+
+      const limit =
+        Number.isFinite(requestedLimit) &&
+        requestedLimit > 0
+          ? Math.min(
+              Math.floor(requestedLimit),
+              200
+            )
+          : 50;
+
+      return res.json({
+        success: true,
+        count: Math.min(
+          cyberLabEvents.length,
+          limit
+        ),
+        events:
+          cyberLabEvents.slice(0, limit),
+      });
+    } catch (error: any) {
+      console.error(
+        "CyberLab events error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Failed to retrieve CyberLab events.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/ai/live-context",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      const context = await getCyberLabLiveContext();
+
+      return res.json({
+        success: true,
+        context,
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Failed to retrieve CyberLab live context.",
+      });
+    }
+  }
+);
+
+
+// TEMPORARY: localhost-only CyberLab live context test
+app.get(
+  "/api/ai/live-context-local",
+  async (req, res) => {
+    const remoteAddress = req.socket.remoteAddress || "";
+
+    const isLocalhost =
+      remoteAddress === "127.0.0.1" ||
+      remoteAddress === "::1" ||
+      remoteAddress === "::ffff:127.0.0.1";
+
+    if (!isLocalhost) {
+      return res.status(403).json({
+        error: "Localhost access only.",
+      });
+    }
+
+    try {
+      const context = await getCyberLabLiveContext();
+
+      return res.json({
+        success: true,
+        context,
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Failed to retrieve CyberLab live context.",
+      });
+    }
+  }
+);
+
+
 function getScanById(scanId: string): ScanRunRecord | null {
   return (
     scanHistory.find(
@@ -715,10 +2783,267 @@ function countVulnerabilities(findings: VulnerabilityFinding[]) {
 }
 
 // ============================================================
+// AUTHENTICATION API
+// ============================================================
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const username =
+      typeof req.body?.username === "string"
+        ? req.body.username.trim()
+        : "";
+
+    const password =
+      typeof req.body?.password === "string"
+        ? req.body.password
+        : "";
+
+    if (!username || !password) {
+      res.status(400).json({
+        error: "Username and password are required.",
+      });
+      return;
+    }
+
+    const [rows] = await cyberlabDb.execute(
+      `
+        SELECT
+          id,
+          username,
+          email,
+          display_name AS displayName,
+          password_hash AS passwordHash,
+          is_active AS isActive
+        FROM users
+        WHERE username = ?
+        LIMIT 1
+      `,
+      [username]
+    );
+
+    const user = (
+      rows as Array<{
+        id: number;
+        username: string;
+        email: string | null;
+        displayName: string;
+        passwordHash: string;
+        isActive: number;
+      }>
+    )[0];
+
+    if (
+      !user ||
+      !user.isActive ||
+      !verifyPassword(
+        password,
+        user.passwordHash
+      )
+    ) {
+      await auditLog(
+        cyberlabDb,
+        req,
+        "auth.login_failed",
+        "user",
+        user ? String(user.id) : undefined,
+        `Failed login attempt for username: ${username}`
+      );
+
+      res.status(401).json({
+        error: "Invalid username or password.",
+      });
+      return;
+    }
+
+    await createSession(
+      cyberlabDb,
+      user.id,
+      req,
+      res
+    );
+
+    await cyberlabDb.execute(
+      `
+        UPDATE users
+        SET last_login_at = NOW()
+        WHERE id = ?
+      `,
+      [user.id]
+    );
+
+    // Reload the authenticated user from the new session.
+    // This gives the request its roles and permissions.
+    await new Promise<void>((resolve, reject) => {
+      authenticate(
+        cyberlabDb,
+        req,
+        res,
+        (error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+
+          resolve();
+        }
+      );
+    });
+
+    await auditLog(
+      cyberlabDb,
+      req,
+      "auth.login",
+      "user",
+      String(user.id),
+      "Successful login."
+    );
+
+    res.json({
+      authenticated: true,
+      user: req.cyberLabUser,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTH] Login error:",
+      error
+    );
+
+    res.status(500).json({
+      error: "Login failed.",
+    });
+  }
+});
+
+app.post("/api/auth/logout", async (req, res) => {
+  try {
+    if (req.cyberLabUser) {
+      await auditLog(
+        cyberlabDb,
+        req,
+        "auth.logout",
+        "user",
+        String(req.cyberLabUser.id),
+        "User logged out."
+      );
+    }
+
+    await destroySession(
+      cyberlabDb,
+      req
+    );
+
+    clearSessionCookie(res);
+
+    res.json({
+      authenticated: false,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTH] Logout error:",
+      error
+    );
+
+    res.status(500).json({
+      error: "Logout failed.",
+    });
+  }
+});
+
+app.post(
+  "/api/auth/reauthenticate",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const password =
+        typeof req.body?.password === "string"
+          ? req.body.password
+          : "";
+
+      if (!password) {
+        res.status(400).json({
+          error: "Password is required.",
+        });
+        return;
+      }
+
+      const [rows] = await cyberlabDb.execute(
+        `
+          SELECT
+            id,
+            username,
+            password_hash AS passwordHash,
+            is_active AS isActive
+          FROM users
+          WHERE id = ?
+          LIMIT 1
+        `,
+        [req.cyberLabUser!.id]
+      );
+
+      const user = (
+        rows as Array<{
+          id: number;
+          username: string;
+          passwordHash: string;
+          isActive: number;
+        }>
+      )[0];
+
+      if (
+        !user ||
+        !user.isActive ||
+        !verifyPassword(password, user.passwordHash)
+      ) {
+        await auditLog(
+          cyberlabDb,
+          req,
+          "auth.reauthentication_failed",
+          "user",
+          String(req.cyberLabUser!.id),
+          "Failed 15-minute security re-authentication."
+        );
+
+        res.status(401).json({
+          error: "Incorrect password.",
+        });
+        return;
+      }
+
+      await auditLog(
+        cyberlabDb,
+        req,
+        "auth.reauthenticated",
+        "user",
+        String(req.cyberLabUser!.id),
+        "Successful 15-minute security re-authentication."
+      );
+
+      res.json({
+        authenticated: true,
+        verified: true,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTH] Re-authentication error:",
+        error
+      );
+
+      res.status(500).json({
+        error: "Re-authentication failed.",
+      });
+    }
+  }
+);
+
+
+
+// ============================================================
 // OBSERVIUM DEVICES API
 // ============================================================
 
-app.get("/api/integrations/observium/devices", async (_req, res) => {
+app.get(
+  "/api/integrations/observium/devices",
+  async (_req, res) => {
   try {
     const [rows] = await observiumDb.query(`
       SELECT
@@ -754,6 +3079,159 @@ app.get("/api/integrations/observium/devices", async (_req, res) => {
     });
   }
 });
+
+// ============================================================
+// OBSERVIUM NETWORK OVERVIEW API
+// ============================================================
+
+app.get(
+  "/api/integrations/observium/overview",
+  async (_req, res) => {
+    try {
+      const [deviceRows] = await observiumDb.query(`
+        SELECT
+          COUNT(*) AS total_devices,
+          SUM(
+            CASE
+              WHEN status = 1
+                AND disabled = 0
+              THEN 1
+              ELSE 0
+            END
+          ) AS online_devices,
+          SUM(
+            CASE
+              WHEN (status = 0 OR disabled = 1)
+              THEN 1
+              ELSE 0
+            END
+          ) AS offline_devices
+        FROM devices
+      `);
+
+      const [portRows] = await observiumDb.query(`
+        SELECT
+          COUNT(*) AS total_interfaces,
+          SUM(
+            CASE
+              WHEN ifOperStatus = 'up'
+              THEN 1
+              ELSE 0
+            END
+          ) AS interfaces_up,
+          SUM(
+            CASE
+              WHEN ifOperStatus <> 'up'
+                OR ifOperStatus IS NULL
+              THEN 1
+              ELSE 0
+            END
+          ) AS interfaces_down,
+          SUM(
+            CASE
+              WHEN ifInErrors_rate > 0
+                OR ifOutErrors_rate > 0
+              THEN 1
+              ELSE 0
+            END
+          ) AS interfaces_with_errors,
+          SUM(
+            CASE
+              WHEN ifInOctets_perc >= 80
+                OR ifOutOctets_perc >= 80
+              THEN 1
+              ELSE 0
+            END
+          ) AS high_utilization_interfaces
+        FROM ports
+        WHERE deleted = 0
+          AND disabled = 0
+      `);
+
+      const [alertRows] = await observiumDb.query(`
+        SELECT
+          COUNT(*) AS active_alerts
+        FROM alert_table
+        WHERE alert_status > 0
+      `);
+
+      const devices = (deviceRows as any[])[0] || {};
+      const ports = (portRows as any[])[0] || {};
+      const alerts = (alertRows as any[])[0] || {};
+
+      const totalDevices = Number(devices.total_devices || 0);
+      const onlineDevices = Number(devices.online_devices || 0);
+      const offlineDevices = Number(devices.offline_devices || 0);
+
+      const totalInterfaces = Number(ports.total_interfaces || 0);
+      const interfacesUp = Number(ports.interfaces_up || 0);
+      const interfacesDown = Number(ports.interfaces_down || 0);
+      const interfacesWithErrors = Number(
+        ports.interfaces_with_errors || 0
+      );
+      const highUtilizationInterfaces = Number(
+        ports.high_utilization_interfaces || 0
+      );
+
+      const activeAlerts = Number(alerts.active_alerts || 0);
+
+      let health = "healthy";
+
+      if (
+        offlineDevices > 0 ||
+        activeAlerts > 0 ||
+        interfacesWithErrors > 0
+      ) {
+        health = "warning";
+      }
+
+      if (
+        offlineDevices > 0 &&
+        offlineDevices === totalDevices &&
+        totalDevices > 0
+      ) {
+        health = "critical";
+      }
+
+      return res.json({
+        timestamp: new Date().toISOString(),
+
+        health,
+
+        devices: {
+          total: totalDevices,
+          online: onlineDevices,
+          offline: offlineDevices,
+        },
+
+        interfaces: {
+          total: totalInterfaces,
+          up: interfacesUp,
+          down: interfacesDown,
+          withErrors: interfacesWithErrors,
+          highUtilization: highUtilizationInterfaces,
+        },
+
+        alerts: {
+          active: activeAlerts,
+        },
+      });
+    } catch (err: any) {
+      console.error(
+        "Observium network overview query failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium network overview.",
+      });
+    }
+  }
+);
+
+
 
 // ============================================================
 // OBSERVIUM DEVICE SEARCH
@@ -2015,6 +4493,36 @@ app.post("/api/scan/network", async (req, res) => {
     };
 
     addScanHistory(record);
+
+    recordCyberLabEvent({
+      type: "network.scan.completed",
+      source: "network-scanner",
+      severity:
+        record.vulnerabilitiesCount.critical > 0
+          ? "critical"
+          : record.vulnerabilitiesCount.high > 0
+          ? "high"
+          : record.vulnerabilitiesCount.medium > 0
+          ? "medium"
+          : record.vulnerabilitiesCount.low > 0
+          ? "low"
+          : "info",
+      title: "Network scan completed",
+      message:
+        `Network scan completed successfully. ` +
+        `Found ${record.hostsFound} host(s) and ` +
+        `${record.openPortsTotal} open port(s).`,
+      target: record.target,
+      metadata: {
+        scanId: record.id,
+        scanType: record.type,
+        durationMs: record.durationMs,
+        hostsFound: record.hostsFound,
+        openPortsTotal: record.openPortsTotal,
+        vulnerabilitiesCount:
+          record.vulnerabilitiesCount,
+      },
+    });
 
     return res.json({
       record,
@@ -3748,6 +6256,90 @@ Prioritize defensive remediation.
 );
 
 // ============================================================
+// 9. AI SECURITY BUDDY
+// ============================================================
+
+app.post(
+  "/api/ai/chat",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const { message } = req.body || {};
+
+      if (
+        typeof message !== "string" ||
+        !message.trim()
+      ) {
+        return res.status(400).json({
+          error: "A message is required.",
+        });
+      }
+
+      const trimmedMessage = message.trim();
+
+      if (trimmedMessage.length > 4000) {
+        return res.status(400).json({
+          error:
+            "Message is too long. Please keep it under 4000 characters.",
+        });
+      }
+
+      const ai = getGeminiClient();
+
+      if (!ai) {
+        return res.status(503).json({
+          error:
+            "Gemini AI is not configured. Please check GEMINI_API_KEY.",
+        });
+      }
+
+      const reply =
+        await generateCyberLabAIResponse(
+          ai,
+          trimmedMessage
+        );
+
+      return res.json({
+        success: true,
+        reply,
+      });
+    } catch (error: any) {
+      console.error(
+        "AI Security Buddy error:",
+        error
+      );
+
+      if (error?.status === 429) {
+        return res.status(429).json({
+          error:
+            "Gemini is temporarily rate-limited. Please wait about one minute and try again.",
+          retryAfterSeconds: 60,
+        });
+      }
+
+      if (
+        error?.status === 503 ||
+        error?.code === 503 ||
+        error?.status === "UNAVAILABLE" ||
+        error?.message?.includes("high demand") ||
+        error?.message?.includes("currently experiencing high demand")
+      ) {
+        return res.status(503).json({
+          error:
+            "CyberLab AI is temporarily unavailable because the Gemini model is experiencing high demand. Your CyberLab scan is not affected. Please try the AI question again shortly.",
+          retryAfterSeconds: 30,
+        });
+      }
+
+      return res.status(500).json({
+        error:
+          "CyberLab AI was unable to generate a response right now. Please try again shortly.",
+      });
+    }
+  }
+);
+
+// ============================================================
 // 9. KALI SERVER MIGRATION GUIDE
 // ============================================================
 
@@ -4317,8 +6909,8 @@ app.get(
   // ============================================================
 
   app.get(
-    "/api/integrations/greenbone/status",
-    async (_req, res) => {
+  "/api/integrations/greenbone/status",
+  async (_req, res) => {
       try {
         const result =
           await runGreenboneGmpCommand(
@@ -4359,8 +6951,8 @@ app.get(
   );
 
   app.get(
-    "/api/integrations/greenbone/tasks",
-    async (_req, res) => {
+  "/api/integrations/greenbone/tasks",
+  async (_req, res) => {
       try {
         const result =
           await runGreenboneGmpCommand(
@@ -4393,8 +6985,8 @@ app.get(
     }
   );
   app.get(
-    "/api/integrations/greenbone/scanners",
-    async (_req, res) => {
+  "/api/integrations/greenbone/scanners",
+  async (_req, res) => {
       try {
         const result =
           await runGreenboneGmpCommand(
@@ -4428,8 +7020,8 @@ app.get(
   );
 
   app.get(
-    "/api/integrations/greenbone/configs",
-    async (_req, res) => {
+  "/api/integrations/greenbone/configs",
+  async (_req, res) => {
       try {
         const result =
           await runGreenboneGmpCommand(
@@ -4462,9 +7054,9 @@ app.get(
     }
   );
 
-       app.get(
-      "/api/integrations/greenbone/targets",
-    async (_req, res) => {
+     app.get(
+  "/api/integrations/greenbone/targets",
+  async (_req, res) => {
       try {
         const result =
           await runGreenboneGmpCommand(
@@ -4497,9 +7089,9 @@ app.get(
     }
   );
 
-  app.get(
-    "/api/integrations/greenbone/reports/:reportId",
-    async (req, res) => {
+app.get(
+  "/api/integrations/greenbone/reports/:reportId",
+  async (req, res) => {
       try {
         const {
           reportId,
@@ -4628,11 +7220,16 @@ app.get(
   `<port_list id="33d0cd82-57c6-11e1-8ed1-406186ea4fc5"/>` +
   `</create_target>`;
 
-        const targetResult =
+               const targetResult =
           await runGreenboneGmpCommand(
             targetXml,
             30000
           );
+
+        console.log(
+          "GREENBONE TARGET RESPONSE:",
+          targetResult.xml
+        );
 
         if (
           targetResult.statusCode < 200 ||
@@ -4896,6 +7493,468 @@ async function startServer(): Promise<void> {
         }
       );
     }
+
+    // --------------------------------------------------------
+    // START TELEGRAM COMMAND LISTENER
+    // --------------------------------------------------------
+
+    registerCyberLabAIClientProvider(
+      () => getGeminiClient()
+    );
+
+    registerCyberLabLiveContextProvider(
+      () => getCyberLabLiveContext()
+    );
+
+    registerTelegramScanHistoryProvider(
+      () => scanHistory
+    );
+
+    registerTelegramGreenboneTaskProvider(
+      async () => {
+        const result =
+          await runGreenboneGmpCommand(
+            "<get_tasks/>"
+          );
+
+        if (result.statusCode !== 200) {
+          throw new Error(
+            result.statusText ||
+            "Greenbone GMP request failed."
+          );
+        }
+
+        const parser = new XMLParser({
+          ignoreAttributes: false,
+          attributeNamePrefix: "@_",
+          trimValues: true,
+        });
+
+        const parsedXml = parser.parse(
+          result.xml || ""
+        );
+
+        const response =
+          parsedXml?.get_tasks_response || {};
+
+        const rawTasks =
+          response.task || [];
+
+        const taskList =
+          Array.isArray(rawTasks)
+            ? rawTasks
+            : [rawTasks];
+
+        const getText = (
+          value: unknown
+        ): string | null => {
+          if (
+            value === null ||
+            value === undefined
+          ) {
+            return null;
+          }
+
+          if (
+            typeof value === "string" ||
+            typeof value === "number"
+          ) {
+            return String(value).trim();
+          }
+
+          return null;
+        };
+
+        return taskList
+          .map((task: any) => {
+            const report =
+              task?.last_report?.report ||
+              task?.current_report?.report ||
+              null;
+
+            const status =
+              getText(task?.status) ||
+              "Unknown";
+
+            const progressText =
+              getText(task?.progress);
+
+            const rawProgress =
+              progressText !== null &&
+              progressText !== ""
+                ? Number.parseInt(
+                    progressText,
+                    10
+                  )
+                : 0;
+
+            const progress =
+              status.toLowerCase() === "done" &&
+              rawProgress < 0
+                ? 100
+                : Number.isNaN(rawProgress)
+                  ? 0
+                  : rawProgress;
+
+            return {
+              id:
+                getText(task?.["@_id"]) ||
+                "",
+              name:
+                getText(task?.name) ||
+                "Unnamed task",
+              status,
+              progress,
+              reportId:
+                getText(report?.["@_id"]),
+            };
+          })
+          .filter(
+            (task: any) => task.id
+          );
+      }
+    );
+
+    registerTelegramGreenboneScanProvider(
+      async ({ target, name }) => {
+        const trimmedTarget = target.trim();
+
+        if (!trimmedTarget) {
+          throw new Error(
+            "A Greenbone target is required."
+          );
+        }
+
+        const scannersResult =
+          await runGreenboneGmpCommand(
+            "<get_scanners/>"
+          );
+
+        if (
+          scannersResult.statusCode < 200 ||
+          scannersResult.statusCode >= 300
+        ) {
+          throw new Error(
+            scannersResult.statusText ||
+            "Failed to retrieve Greenbone scanners."
+          );
+        }
+
+        const scannerParser = new XMLParser({
+          ignoreAttributes: false,
+          attributeNamePrefix: "@_",
+          trimValues: true,
+        });
+
+        const scannersXml =
+          scannerParser.parse(
+            scannersResult.xml || ""
+          );
+
+        const rawScanners =
+          scannersXml?.get_scanners_response?.scanner || [];
+
+        const scannerList =
+          Array.isArray(rawScanners)
+            ? rawScanners
+            : [rawScanners];
+
+        const scannerCandidates =
+          scannerList
+            .map((scanner: any) => ({
+              id:
+                typeof scanner?.["@_id"] === "string"
+                  ? scanner["@_id"].trim()
+                  : "",
+              name:
+                typeof scanner?.name === "string"
+                  ? scanner.name.trim()
+                  : "",
+            }))
+            .filter(
+              (scanner: any) =>
+                scanner.id &&
+                scanner.name
+            );
+
+        const preferredScanner =
+          scannerCandidates.find(
+            (scanner: any) =>
+              scanner.name.toLowerCase() ===
+              "openvas default"
+          ) ||
+          scannerCandidates.find(
+            (scanner: any) =>
+              scanner.name.toLowerCase().includes(
+                "openvas"
+              )
+          ) ||
+          scannerCandidates[0];
+
+        if (!preferredScanner?.id) {
+          throw new Error(
+            "No usable Greenbone scanner was found."
+          );
+        }
+
+        const configsResult =
+          await runGreenboneGmpCommand(
+            "<get_configs/>"
+          );
+
+        if (
+          configsResult.statusCode < 200 ||
+          configsResult.statusCode >= 300
+        ) {
+          throw new Error(
+            configsResult.statusText ||
+            "Failed to retrieve Greenbone scan configurations."
+          );
+        }
+
+        const configParser = new XMLParser({
+          ignoreAttributes: false,
+          attributeNamePrefix: "@_",
+          trimValues: true,
+        });
+
+        const configsXml =
+          configParser.parse(
+            configsResult.xml || ""
+          );
+
+        const rawConfigs =
+          configsXml?.get_configs_response?.config || [];
+
+        const configList =
+          Array.isArray(rawConfigs)
+            ? rawConfigs
+            : [rawConfigs];
+
+        const configCandidates =
+          configList
+            .map((config: any) => ({
+              id:
+                typeof config?.["@_id"] === "string"
+                  ? config["@_id"].trim()
+                  : "",
+              name:
+                typeof config?.name === "string"
+                  ? config.name.trim()
+                  : "",
+              usageType:
+                typeof config?.usage_type === "string"
+                  ? config.usage_type.trim()
+                  : "",
+            }))
+            .filter(
+              (config: any) =>
+                config.id &&
+                config.name &&
+                (
+                  !config.usageType ||
+                  config.usageType === "scan"
+                )
+            );
+
+        const preferredConfig =
+          configCandidates.find(
+            (config: any) =>
+              config.name.toLowerCase() ===
+              "full and fast"
+          ) ||
+          configCandidates.find(
+            (config: any) =>
+              config.name.toLowerCase().includes(
+                "full"
+              )
+          ) ||
+          configCandidates[0];
+
+        if (!preferredConfig?.id) {
+          throw new Error(
+            "No usable Greenbone scan configuration was found."
+          );
+        }
+
+        const scanName =
+          typeof name === "string" &&
+          name.trim()
+            ? name.trim()
+            : `CyberLab Telegram Greenbone Scan - ${trimmedTarget}`;
+
+        const targetXml =
+          `<create_target>` +
+          `<name>${escapeXml(
+            scanName
+          )}</name>` +
+          `<hosts>${escapeXml(
+            trimmedTarget
+          )}</hosts>` +
+          `<port_list id="33d0cd82-57c6-11e1-8ed1-406186ea4fc5"/>` +
+          `</create_target>`;
+
+        const targetResult =
+          await runGreenboneGmpCommand(
+            targetXml,
+            30000
+          );
+
+        if (
+          targetResult.statusCode < 200 ||
+          targetResult.statusCode >= 300
+        ) {
+          throw new Error(
+            "Greenbone failed to create the target."
+          );
+        }
+
+        let targetId: string | null = null;
+
+        try {
+          const targetResponseParser = new XMLParser({
+            ignoreAttributes: false,
+            attributeNamePrefix: "@_",
+            trimValues: true,
+          });
+
+          const targetResponseXml =
+            targetResponseParser.parse(
+              targetResult.xml || ""
+            );
+
+          const parsedTargetId =
+            targetResponseXml
+              ?.create_target_response?.["@_id"];
+
+          if (
+            typeof parsedTargetId === "string" &&
+            parsedTargetId.trim()
+          ) {
+            targetId = parsedTargetId.trim();
+          }
+        } catch (parseError) {
+          console.error(
+            "[Telegram Greenbone] Failed to parse create_target response:",
+            parseError
+          );
+        }
+
+        if (!targetId) {
+          const targetIdMatch =
+            targetResult.xml.match(
+              /<create_target_response\b[^>]*\bid\s*=\s*["']([^"']+)["']/i
+            );
+
+          targetId =
+            targetIdMatch?.[1]?.trim() || null;
+        }
+
+        if (!targetId) {
+          console.error(
+            "[Telegram Greenbone] create_target response:",
+            targetResult.xml
+          );
+
+          throw new Error(
+            "Greenbone created the target but did not return a target ID."
+          );
+        }
+
+        const taskXml =
+          `<create_task>` +
+          `<name>${escapeXml(
+            scanName
+          )}</name>` +
+          `<comment>Created by Kali CyberLab Telegram.</comment>` +
+          `<config id="${escapeXml(
+            preferredConfig.id
+          )}"/>` +
+          `<target id="${escapeXml(
+            targetId
+          )}"/>` +
+          `<scanner id="${escapeXml(
+            preferredScanner.id
+          )}"/>` +
+          `</create_task>`;
+
+        const taskResult =
+          await runGreenboneGmpCommand(
+            taskXml,
+            30000
+          );
+
+        if (
+          taskResult.statusCode < 200 ||
+          taskResult.statusCode >= 300
+        ) {
+          throw new Error(
+            "Greenbone failed to create the scan task."
+          );
+        }
+
+        const taskIdMatch =
+          taskResult.xml.match(
+            /<create_task_response[^>]*id="([^"]+)"/
+          );
+
+        const taskId =
+          taskIdMatch?.[1] || null;
+
+        if (!taskId) {
+          throw new Error(
+            "Greenbone created the task but did not return a task ID."
+          );
+        }
+
+        const startXml =
+          `<start_task task_id="${escapeXml(
+            taskId
+          )}"/>`;
+
+        const startResult =
+          await runGreenboneGmpCommand(
+            startXml,
+            30000
+          );
+
+        if (
+          startResult.statusCode < 200 ||
+          startResult.statusCode >= 300
+        ) {
+          throw new Error(
+            "Greenbone created the task but failed to start it."
+          );
+        }
+
+        const reportIdMatch =
+          startResult.xml.match(
+            /<report[^>]*id="([^"]+)"/
+          );
+
+        const reportId =
+          reportIdMatch?.[1] || null;
+
+        return {
+          success: true,
+          message:
+            "Greenbone scan created and started successfully.",
+          scan: {
+            name: scanName,
+            target: trimmedTarget,
+            targetId,
+            taskId,
+            reportId,
+            configId: preferredConfig.id,
+            scannerId: preferredScanner.id,
+          },
+        };
+      }
+    );
+
+    startGreenboneAlertMonitor();
+
+    void startTelegramCommandListener();
 
     // --------------------------------------------------------
     // START HTTP SERVER

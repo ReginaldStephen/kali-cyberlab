@@ -10,7 +10,9 @@ import {
   History,
   Server,
   Code,
-  Boxes
+  Boxes,
+  LogOut,
+  Bell,
 } from "lucide-react";
 
 interface NavbarProps {
@@ -21,6 +23,7 @@ interface NavbarProps {
   continuousSeconds: number;
   openHistory: () => void;
   historyCount: number;
+  onLogout: () => void;
   serverHostname?: string;
   osDistro?: string;
 }
@@ -33,6 +36,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   continuousSeconds,
   openHistory,
   historyCount,
+  onLogout,
   serverHostname = "kali-srv-01",
   osDistro = "Kali Linux SOC",
 }) => {
@@ -43,6 +47,8 @@ const tabs = [
   { id: "remediation", label: "Vulnerabilities & Fixes", icon: ShieldAlert },
   { id: "reports", label: "Executive Reports", icon: FileText },
   { id: "arsenal", label: "Security Arsenal", icon: Boxes },
+  { id: "activity", label: "Activity Log", icon: Activity },
+  { id: "alerts", label: "Alert Center", icon: Bell },
   { id: "python", label: "Python Engine", icon: Code },
   { id: "migration", label: "Kali Deploy Kit", icon: DownloadCloud },
 ];
@@ -117,6 +123,18 @@ const tabs = [
           >
             <History className="h-3.5 w-3.5 text-slate-400" />
             <span className="uppercase text-[11px]">Logs ({historyCount})</span>
+          </button>
+
+          {/* Logout */}
+          <button
+            onClick={onLogout}
+            title="Sign out of CyberLab"
+            className="flex shrink-0 items-center gap-1.5 rounded border border-red-900/50 bg-red-950/30 px-2.5 py-1.5 text-xs font-mono font-bold text-red-400 transition-colors hover:border-red-600/60 hover:bg-red-600 hover:text-white"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            <span className="uppercase text-[11px]">
+              Logout
+            </span>
           </button>
         </div>
       </div>

@@ -109,6 +109,26 @@ interface ObserviumDevicesResponse {
   devices: ObserviumDevice[];
 }
 
+interface ObserviumOverviewResponse {
+  timestamp: string;
+  health: "healthy" | "warning" | "critical";
+  devices: {
+    total: number;
+    online: number;
+    offline: number;
+  };
+  interfaces: {
+    total: number;
+    up: number;
+    down: number;
+    withErrors: number;
+    highUtilization: number;
+  };
+  alerts: {
+    active: number;
+  };
+}
+
 interface ObserviumDashboardProps {
   onBack?: () => void;
 }
@@ -190,6 +210,10 @@ export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
   onBack,
 }) => {
   const [devices, setDevices] = useState<ObserviumDevice[]>([]);
+
+  const [overview, setOverview] =
+  useState<ObserviumOverviewResponse | null>(null);
+
   const [selectedDeviceId, setSelectedDeviceId] = useState<number | null>(
     null
   );
@@ -233,6 +257,33 @@ export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
     } finally {
       setIsLoading(false);
     }
+    }, []);
+
+  const loadOverview = useCallback(async () => {
+    try {
+      const response = await fetch(
+        "/api/integrations/observium/overview"
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => null);
+
+        throw new Error(
+          errorData?.error || "Unable to retrieve Observium network overview."
+        );
+      }
+
+      const data: ObserviumOverviewResponse = await response.json();
+
+      setOverview(data);
+    } catch (err: any) {
+      console.error("Observium network overview error:", err);
+
+      setError(
+        err?.message ||
+          "Unable to retrieve the Observium network overview."
+      );
+    }
   }, []);
 
   const loadDeviceDetails = useCallback(async (deviceId: number) => {
@@ -267,18 +318,20 @@ export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
     }
   }, []);
 
-  useEffect(() => {
-    loadDevices();
-  }, [loadDevices]);
+ useEffect(() => {
+  loadDevices();
+  loadOverview();
+}, [loadDevices, loadOverview]);
 
   useEffect(() => {
     const interval = setInterval(() => {
-      loadDevices();
+  loadDevices();
+  loadOverview();
 
-      if (selectedDeviceId !== null) {
-        loadDeviceDetails(selectedDeviceId);
-      }
-    }, 15000);
+  if (selectedDeviceId !== null) {
+    loadDeviceDetails(selectedDeviceId);
+  }
+}, 15000);
 
     return () => clearInterval(interval);
   }, [loadDevices, loadDeviceDetails, selectedDeviceId]);
@@ -445,6 +498,186 @@ export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
           </div>
         </div>
       )}
+
+      {/* Network Overview */}
+      <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-5">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-emerald-400">
+              NETWORK OVERVIEW
+            </div>
+
+            <h2 className="mt-1 text-sm font-bold text-slate-100">
+              Infrastructure Health
+            </h2>
+
+            <p className="mt-1 text-[10px] text-slate-600">
+              Live network status collected from the Observium monitoring
+              database.
+            </p>
+          </div>
+
+          <div
+            className={`inline-flex items-center gap-2 self-start rounded-full border px-3 py-1.5 text-[9px] font-bold uppercase tracking-widest ${
+              overview?.health === "critical"
+                ? "border-red-500/30 bg-red-500/10 text-red-400"
+                : overview?.health === "warning"
+                ? "border-amber-500/30 bg-amber-500/10 text-amber-400"
+                : overview?.health === "healthy"
+                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                : "border-slate-700 bg-slate-900 text-slate-500"
+            }`}
+          >
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${
+                overview?.health === "critical"
+                  ? "bg-red-400"
+                  : overview?.health === "warning"
+                  ? "bg-amber-400"
+                  : overview?.health === "healthy"
+                  ? "bg-emerald-400"
+                  : "bg-slate-600"
+              }`}
+            />
+
+            {overview?.health
+              ? overview.health
+              : "Loading"}
+          </div>
+        </div>
+
+        <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {/* Devices */}
+          <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
+            <div className="flex items-center justify-between">
+              <div className="text-[9px] font-bold uppercase tracking-widest text-slate-600">
+                Devices
+              </div>
+
+              <Server className="h-4 w-4 text-slate-500" />
+            </div>
+
+            <div className="mt-3 flex items-end justify-between gap-3">
+              <div className="font-mono text-2xl font-bold text-slate-100">
+                {overview ? overview.devices.total : "…"}
+              </div>
+
+              <div className="text-right text-[9px] uppercase tracking-wider">
+                <div className="text-emerald-400">
+                  {overview ? overview.devices.online : "—"} online
+                </div>
+
+                <div className="mt-1 text-red-400">
+                  {overview ? overview.devices.offline : "—"} offline
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Interfaces */}
+          <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
+            <div className="flex items-center justify-between">
+              <div className="text-[9px] font-bold uppercase tracking-widest text-slate-600">
+                Interfaces
+              </div>
+
+              <Network className="h-4 w-4 text-slate-500" />
+            </div>
+
+            <div className="mt-3 flex items-end justify-between gap-3">
+              <div className="font-mono text-2xl font-bold text-slate-100">
+                {overview ? overview.interfaces.total : "…"}
+              </div>
+
+              <div className="text-right text-[9px] uppercase tracking-wider">
+                <div className="text-emerald-400">
+                  {overview ? overview.interfaces.up : "—"} up
+                </div>
+
+                <div className="mt-1 text-red-400">
+                  {overview ? overview.interfaces.down : "—"} down
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Interface Problems */}
+          <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
+            <div className="flex items-center justify-between">
+              <div className="text-[9px] font-bold uppercase tracking-widest text-slate-600">
+                Interface Problems
+              </div>
+
+              <AlertTriangle className="h-4 w-4 text-amber-400" />
+            </div>
+
+            <div className="mt-3 flex items-end justify-between gap-3">
+              <div className="font-mono text-2xl font-bold text-slate-100">
+                {overview
+                  ? overview.interfaces.withErrors +
+                    overview.interfaces.highUtilization
+                  : "…"}
+              </div>
+
+              <div className="text-right text-[9px] uppercase tracking-wider">
+                <div className="text-red-400">
+                  {overview
+                    ? overview.interfaces.withErrors
+                    : "—"}{" "}
+                  errors
+                </div>
+
+                <div className="mt-1 text-amber-400">
+                  {overview
+                    ? overview.interfaces.highUtilization
+                    : "—"}{" "}
+                  high util.
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Alerts */}
+          <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
+            <div className="flex items-center justify-between">
+              <div className="text-[9px] font-bold uppercase tracking-widest text-slate-600">
+                Active Alerts
+              </div>
+
+              <AlertTriangle className="h-4 w-4 text-red-400" />
+            </div>
+
+            <div className="mt-3 flex items-end justify-between gap-3">
+              <div
+                className={`font-mono text-2xl font-bold ${
+                  overview?.alerts.active
+                    ? "text-red-400"
+                    : "text-emerald-400"
+                }`}
+              >
+                {overview ? overview.alerts.active : "…"}
+              </div>
+
+              <div className="text-right text-[9px] uppercase tracking-wider">
+                <div
+                  className={
+                    overview?.alerts.active
+                      ? "text-red-400"
+                      : "text-emerald-400"
+                  }
+                >
+                  {overview?.alerts.active ? "Attention" : "All clear"}
+                </div>
+
+                <div className="mt-1 text-slate-600">
+                  Observium alerts
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
 
       {/* Summary cards */}
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">

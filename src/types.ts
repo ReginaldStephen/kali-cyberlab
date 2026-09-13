@@ -207,6 +207,59 @@ export interface ScanRunRecord {
   };
 }
 
+export type CyberLabEventSeverity =
+  | 'info'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'critical';
+
+export interface CyberLabEvent {
+  id: string;
+  timestamp: string;
+
+  type: string;
+  source: string;
+  severity: CyberLabEventSeverity;
+
+  title: string;
+  message: string;
+
+  target?: string;
+
+  metadata?: Record<string, unknown>;
+}
+
+export type CyberLabAlertStatus =
+  | "pending"
+  | "acknowledged"
+  | "resolved";
+
+export interface CyberLabAlert {
+  id: string;
+  eventId: string;
+  createdAt: string;
+
+  severity: CyberLabEventSeverity;
+  priority:
+    | "none"
+    | "normal"
+    | "important"
+    | "immediate";
+
+  status: CyberLabAlertStatus;
+
+  source: string;
+  type: string;
+  title: string;
+  message: string;
+
+  target?: string;
+
+  acknowledgedAt?: string;
+  resolvedAt?: string;
+}
+
 export interface RemediationReport {
   id: string;
   title: string;
