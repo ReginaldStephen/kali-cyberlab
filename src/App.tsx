@@ -15,7 +15,6 @@ import {
   TerminalExecutionResponse
 } from "./types";
 import { Navbar } from "./components/Navbar";
-import { SystemHealthBanner } from "./components/SystemHealthBanner";
 import { NetworkScanner } from "./components/NetworkScanner";
 import { WebAuditor } from "./components/WebAuditor";
 import { TerminalRunner } from "./components/TerminalRunner";
@@ -28,12 +27,14 @@ import { SecurityToolsHub } from "./components/SecurityToolsHub";
 import { SecurityArsenal } from "./components/SecurityArsenal";
 import { ObserviumDashboard } from "./components/ObserviumDashboard";
 import { GreenboneDashboard } from "./components/GreenboneDashboard";
+import { TSharkDashboard } from "./components/TSharkDashboard";
 import { AISecurityBuddy } from "./components/AISecurityBuddy";
-import { ActivityLog } from "./components/ActivityLog";
-import { AlertCenter } from "./components/AlertCenter";
+import { ActivityCenter } from "./components/ActivityCenter";
 import { Login } from "./components/Login";
+import { CyberLabHome } from "./components/CyberLabHome";
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<string>("network");
+  const [activeTab, setActiveTab] = useState<string>("home");
 
   // CyberLab Authentication
   const [authUser, setAuthUser] = useState<any>(null);
@@ -554,15 +555,17 @@ export default function App() {
       {/* Main Container */}
       <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-5 sm:px-6 space-y-5">
         
-        {/* Live Host Telemetry & Hardware Banner */}
-        <SystemHealthBanner
-          health={systemHealth}
-          isLoading={isHealthLoading}
-          onRefresh={fetchSystemHealth}
-        />
-
         {/* Tab Views */}
-            {activeTab === "network" && (
+            {activeTab === "home" && (
+        <CyberLabHome
+          systemHealth={systemHealth}
+          isHealthLoading={isHealthLoading}
+          scanHistory={scanHistory}
+          onNavigate={setActiveTab}
+        />
+      )}
+
+      {activeTab === "network" && (
             <NetworkScanner
               onRunScan={handleRunNetworkScan}
               isLoading={isScanLoading}
@@ -618,14 +621,9 @@ export default function App() {
         {activeTab === "migration" && (
           <KaliMigrationGuide />
         )}
-
-        {activeTab === "activity" && (
-          <ActivityLog />
-        )}
-
-        {activeTab === "alerts" && (
-          <AlertCenter />
-        )}
+      {activeTab === "activity" && (
+        <ActivityCenter />
+      )}
 
       {activeTab === "arsenal" && (
   <SecurityArsenal
@@ -637,6 +635,9 @@ export default function App() {
     }}
     onOpenGreenbone={() => {
       setActiveTab("greenbone");
+    }}
+    onOpenTShark={() => {
+      setActiveTab("tshark");
     }}
   />
 )}
@@ -651,6 +652,14 @@ export default function App() {
 
 {activeTab === "greenbone" && (
   <GreenboneDashboard
+    onBack={() => {
+      setActiveTab("arsenal");
+    }}
+  />
+)}
+
+{activeTab === "tshark" && (
+  <TSharkDashboard
     onBack={() => {
       setActiveTab("arsenal");
     }}
@@ -782,7 +791,7 @@ export default function App() {
 
             {/* Animated red security glow */}
             <div
-              className="pointer-events-none absolute left-1/2 top-1/2 h-[600px] w-[600px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-red-900/20 blur-3xl"
+              className="pointer-events-none absolute left-1/2 top-1/2 h-[600px] w-[600px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-900/20 blur-3xl"
               style={{
                 animation: "cyberlabGlow 3s ease-in-out infinite",
               }}
@@ -800,7 +809,7 @@ export default function App() {
 
             {/* Moving scan line */}
             <div
-              className="pointer-events-none absolute left-0 right-0 h-px bg-red-500/40 shadow-[0_0_20px_rgba(239,68,68,0.8)]"
+              className="pointer-events-none absolute left-0 right-0 h-px bg-cyan-500/40 shadow-[0_0_20px_rgba(239,68,68,0.8)]"
               style={{
                 animation: "cyberlabScan 4s linear infinite",
               }}
@@ -808,25 +817,25 @@ export default function App() {
 
             {/* Security panel */}
             <div
-              className="relative z-10 w-[92%] max-w-md overflow-hidden rounded-2xl border border-red-900/60 bg-slate-950/95 shadow-[0_0_80px_rgba(127,29,29,0.35)]"
+              className="relative z-10 w-[92%] max-w-md overflow-hidden rounded-2xl border border-cyan-900/60 bg-slate-950/95 shadow-[0_0_80px_rgba(8,145,178,0.30)]"
               style={{
                 animation: "cyberlabPanelIn 0.55s ease-out",
               }}
             >
               {/* Top security strip */}
-              <div className="h-1 w-full bg-gradient-to-r from-red-950 via-red-500 to-red-950" />
+              <div className="h-1 w-full bg-gradient-to-r from-cyan-950 via-cyan-500 to-cyan-950" />
 
               <div className="p-7">
                 {/* Security icon */}
                 <div className="mb-6 flex justify-center">
                   <div className="relative">
-                    <div className="absolute inset-0 animate-ping rounded-full bg-red-500/20" />
+                    <div className="absolute inset-0 animate-ping rounded-full bg-cyan-500/20" />
 
-                    <div className="relative flex h-20 w-20 items-center justify-center rounded-full border border-red-500/40 bg-red-950/40 shadow-[0_0_35px_rgba(239,68,68,0.25)]">
+                    <div className="relative flex h-20 w-20 items-center justify-center rounded-full border border-cyan-500/40 bg-cyan-950/40 shadow-[0_0_35px_rgba(34,211,238,0.22)]">
                       {reauthSuccess ? (
                         <CheckCircle2 className="h-10 w-10 text-emerald-400" />
                       ) : (
-                        <LockKeyhole className="h-10 w-10 text-red-400" />
+                        <LockKeyhole className="h-10 w-10 text-cyan-400" />
                       )}
                     </div>
                   </div>
@@ -839,7 +848,7 @@ export default function App() {
                       className={`h-2 w-2 rounded-full ${
                         reauthSuccess
                           ? "bg-emerald-400"
-                          : "bg-red-500 animate-pulse"
+                          : "bg-cyan-400 animate-pulse"
                       }`}
                     />
                     <span className="font-mono text-[10px] font-bold uppercase tracking-[0.3em] text-slate-500">
@@ -853,7 +862,7 @@ export default function App() {
                     className={`text-2xl font-black uppercase tracking-widest ${
                       reauthSuccess
                         ? "text-emerald-400"
-                        : "text-white"
+                        : "text-cyan-400"
                     }`}
                   >
                     {reauthSuccess
@@ -861,7 +870,7 @@ export default function App() {
                       : "Session Locked"}
                   </h2>
 
-                  <p className="mt-2 font-mono text-xs uppercase tracking-wider text-red-400">
+                  <p className="mt-2 font-mono text-xs uppercase tracking-wider text-cyan-400">
                     15-Minute Re-Authentication Required
                   </p>
 
@@ -911,8 +920,8 @@ export default function App() {
                         disabled={reauthLoading}
                         className={`w-full rounded-lg border bg-slate-900/80 py-3 pl-10 pr-4 font-mono text-sm text-white outline-none transition-all placeholder:text-slate-700 ${
                           reauthError
-                            ? "border-red-500/70 shadow-[0_0_20px_rgba(239,68,68,0.12)]"
-                            : "border-slate-700 focus:border-red-500/70 focus:ring-1 focus:ring-red-500/30"
+                            ? "border-cyan-500/70 shadow-[0_0_20px_rgba(34,211,238,0.12)]"
+                            : "border-slate-700 focus:border-cyan-500/70 focus:ring-1 focus:ring-cyan-500/30"
                         }`}
                       />
                     </div>
@@ -938,11 +947,11 @@ export default function App() {
                       disabled={
                         reauthLoading || !reauthPassword
                       }
-                      className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg border border-red-700/60 bg-red-950/50 px-4 py-3 font-mono text-xs font-bold uppercase tracking-widest text-red-300 transition-all duration-300 hover:border-red-500 hover:bg-red-600 hover:text-white hover:shadow-[0_0_30px_rgba(239,68,68,0.25)] disabled:cursor-not-allowed disabled:opacity-40"
+                      className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg border border-cyan-700/60 bg-cyan-950/50 px-4 py-3 font-mono text-xs font-bold uppercase tracking-widest text-cyan-300 transition-all duration-300 hover:border-cyan-400 hover:bg-cyan-600 hover:text-white hover:shadow-[0_0_30px_rgba(34,211,238,0.25)] disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       {reauthLoading ? (
                         <>
-                          <span className="h-4 w-4 animate-spin rounded-full border-2 border-red-300/30 border-t-red-300" />
+                          <span className="h-4 w-4 animate-spin rounded-full border-2 border-cyan-300/30 border-t-cyan-300" />
                           Verifying Identity...
                         </>
                       ) : (
@@ -961,7 +970,7 @@ export default function App() {
                     <p className="font-mono text-[9px] uppercase tracking-widest text-slate-600">
                       Interface Status
                     </p>
-                    <p className="mt-1 font-mono text-[10px] font-bold uppercase text-red-400">
+                    <p className="mt-1 font-mono text-[10px] font-bold uppercase text-cyan-400">
                       Access Restricted
                     </p>
                   </div>
@@ -969,7 +978,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={handleLogout}
-                    className="rounded border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-[10px] font-bold uppercase tracking-wider text-slate-500 transition-colors hover:border-red-700/60 hover:bg-red-950/40 hover:text-red-400"
+                    className="rounded border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-[10px] font-bold uppercase tracking-wider text-slate-500 transition-colors hover:border-cyan-700/60 hover:bg-cyan-950/40 hover:text-cyan-400"
                   >
                     Logout
                   </button>

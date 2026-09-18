@@ -21,6 +21,7 @@ interface SecurityArsenalProps {
   onLaunch: (url: string) => void;
   onOpenObservium: () => void;
   onOpenGreenbone: () => void;
+  onOpenTShark: () => void;
 }
 
 interface IntegrationStatus {
@@ -68,6 +69,16 @@ const tools: SecurityTool[] = [
     url: "http://45.222.128.31/observium",
     status: "ready",
     icon: Activity,
+  },
+  {
+    id: "tshark",
+    name: "TShark Network Analyzer",
+    category: "PACKET ANALYSIS",
+    description:
+      "Live packet capture, protocol analysis, traffic statistics and network visibility powered by TShark.",
+    url: "",
+    status: "ready",
+    icon: Network,
   },
   {
     id: "burp",
@@ -153,6 +164,7 @@ export const SecurityArsenal: React.FC<SecurityArsenalProps> = ({
   onLaunch,
   onOpenObservium,
   onOpenGreenbone,
+  onOpenTShark,
 }) => {
     const [integrationStatuses, setIntegrationStatuses] =
     useState<Record<string, IntegrationStatus>>({});
@@ -501,12 +513,16 @@ export const SecurityArsenal: React.FC<SecurityArsenalProps> = ({
                 ? onOpenGreenbone()
                 : tool.id === "observium"
                 ? onOpenObservium()
+                : tool.id === "tshark"
+                ? onOpenTShark()
                 : handleLaunch(tool)
                 }
                 className="flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-white transition-colors hover:bg-emerald-500"
               >
                 <ExternalLink className="h-3.5 w-3.5" />
-                {tool.id === "greenbone" || tool.id === "observium"
+                {tool.id === "greenbone" ||
+                tool.id === "observium" ||
+                tool.id === "tshark"
                 ? "Open Dashboard"
                 : "Launch Tool"}
               </button>

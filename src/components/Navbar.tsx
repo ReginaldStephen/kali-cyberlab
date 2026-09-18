@@ -1,5 +1,5 @@
 import React from "react";
-import {
+import { Home,
   ShieldAlert,
   Activity,
   Terminal,
@@ -40,25 +40,25 @@ export const Navbar: React.FC<NavbarProps> = ({
   serverHostname = "kali-srv-01",
   osDistro = "Kali Linux SOC",
 }) => {
-const tabs = [
+const tabs = [  { id: "home", label: "Home", icon: Home },
+
   { id: "network", label: "Network Scanner", icon: Activity },
   { id: "web", label: "Web Posture Audit", icon: Globe },
   { id: "terminal", label: "Kali Terminal", icon: Terminal },
   { id: "remediation", label: "Vulnerabilities & Fixes", icon: ShieldAlert },
   { id: "reports", label: "Executive Reports", icon: FileText },
   { id: "arsenal", label: "Security Arsenal", icon: Boxes },
-  { id: "activity", label: "Activity Log", icon: Activity },
-  { id: "alerts", label: "Alert Center", icon: Bell },
+  { id: "activity", label: "Activity Center", icon: Bell },
   { id: "python", label: "Python Engine", icon: Code },
   { id: "migration", label: "Kali Deploy Kit", icon: DownloadCloud },
 ];
 
   return (
     <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-900/95 backdrop-blur-md">
-      <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 sm:px-6">
+      <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3 sm:px-6">
         
         {/* Brand & SOC Host Indicator */}
-        <div className="flex items-center gap-3">
+        <div className="flex shrink-0 items-center gap-3">
           <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-950 border border-slate-800 text-emerald-400 shadow-sm relative">
             <Server className="h-4 w-4" />
             <div className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse border-2 border-slate-900" />
@@ -79,7 +79,7 @@ const tabs = [
         </div>
 
         {/* Center / Nav Tabs */}
-        <nav className="hidden lg:flex items-center gap-1.5 rounded-lg bg-slate-950/80 p-1 border border-slate-800">
+        <nav className="hidden lg:flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto rounded-lg bg-slate-950/80 p-1 border border-slate-800 scrollbar-none">
           {tabs.map((tab) => {
             const Icon = tab.icon;
             const isActive = activeTab === tab.id;
@@ -87,7 +87,7 @@ const tabs = [
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
-                className={`flex items-center gap-2 rounded px-3 py-1.5 text-xs font-mono font-medium transition-all ${
+                className={`flex shrink-0 items-center gap-2 rounded px-3 py-1.5 text-xs font-mono font-medium transition-all ${
                   isActive
                     ? "bg-slate-800 text-white shadow-xs border border-slate-700/80"
                     : "text-slate-400 hover:bg-slate-900 hover:text-slate-200"
@@ -101,7 +101,7 @@ const tabs = [
         </nav>
 
         {/* Right Tools: 5s Continuous Scan Toggle & History */}
-        <div className="flex items-center gap-2">
+        <div className="shrink-0 flex items-center gap-2">
           {/* Continuous 5s scanner toggle */}
           <button
             onClick={onToggleContinuous}

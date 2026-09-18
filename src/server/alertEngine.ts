@@ -1,3 +1,9 @@
+import {
+  persistCyberLabEvent,
+  persistCyberLabAlert,
+  updatePersistedCyberLabAlertStatus,
+  loadCyberLabAlerts,
+} from "./cyberlabPersistence";
 import type {
   CyberLabAlert,
   CyberLabAlertStatus,
@@ -16,10 +22,36 @@ const cyberLabAlerts: CyberLabAlert[] = [];
 
 const MAX_ALERTS = 200;
 
+export async function loadPersistedCyberLabAlerts(): Promise<void> {
+  try {
+    const persistedAlerts = await loadCyberLabAlerts();
+
+    cyberLabAlerts.length = 0;
+    cyberLabAlerts.push(...persistedAlerts.slice(0, MAX_ALERTS));
+
+    console.log(
+      `[CyberLab Persistence] Loaded ${cyberLabAlerts.length} persisted alert(s).`
+    );
+  } catch (error) {
+    console.error(
+      "[CyberLab Persistence] Failed to load persisted alerts:",
+      error
+    );
+  }
+}
+
 export function processCyberLabEvent(
   event: CyberLabEvent
 ): CyberLabAlert | null {
-  const decision = evaluateCyberLabAlert(
+
+  void persistCyberLabEvent(event).catch((error) => {
+    console.error(
+      "[CyberLab Persistence] Failed to persist event:",
+      error
+    );
+  });
+
+const decision = evaluateCyberLabAlert(
     event.severity,
     event.type
   );
@@ -58,6 +90,13 @@ export function processCyberLabEvent(
   };
 
   cyberLabAlerts.unshift(alert);
+
+  void persistCyberLabAlert(alert).catch((error) => {
+    console.error(
+      "[CyberLab Persistence] Failed to persist alert:",
+      error
+    );
+  });
 
   void sendCyberLabAlertToTelegram(alert).catch(
     (error) => {
@@ -102,6 +141,22 @@ export function getPendingCyberLabAlerts(): CyberLabAlert[] {
   );
 }
 
+export function getCyberLabAlertById(
+  alertId: string
+): CyberLabAlert | null {
+  const normalizedAlertId = alertId.trim();
+
+  if (!normalizedAlertId) {
+    return null;
+  }
+
+  return (
+    cyberLabAlerts.find(
+      (alert) => alert.id === normalizedAlertId
+    ) || null
+  );
+}
+
 export function updateCyberLabAlertStatus(
   alertId: string,
   status: CyberLabAlertStatus
@@ -129,6 +184,13 @@ export function updateCyberLabAlertStatus(
       alert.acknowledgedAt = now;
     }
   }
+
+  void updatePersistedCyberLabAlertStatus(alert).catch((error) => {
+    console.error(
+      "[CyberLab Persistence] Failed to update alert status:",
+      error
+    );
+  });
 
   return alert;
 }

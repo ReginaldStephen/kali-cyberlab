@@ -4,6 +4,7 @@ import {
   getCyberLabAlerts,
   getCyberLabAlertStats,
   updateCyberLabAlertStatus,
+  loadPersistedCyberLabAlerts,
 } from "./src/server/alertEngine";
 import "dotenv/config";
 import {
@@ -11,6 +12,7 @@ import {
   registerTelegramScanHistoryProvider,
   registerTelegramGreenboneTaskProvider,
   registerTelegramGreenboneScanProvider,
+  registerTelegramTSharkProvider,
 } from "./src/server/telegramCommands";
 import {
   generateCyberLabAIResponse,
@@ -29,6 +31,29 @@ import net from "net";
 import { GoogleGenAI } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import { XMLParser } from "fast-xml-parser";
+import {
+  initializeCyberLabPersistence,
+} from "./src/server/cyberlabPersistence";
+
+import {
+  getTSharkVersion,
+  getTSharkInterfaces,
+  getTSharkCaptureState,
+  getTSharkPackets,
+  getTSharkStatistics,
+  clearTSharkCapture,
+  startTSharkCapture,
+  stopTSharkCapture,
+  getTSharkCapabilities,
+  getTSharkProtocols,
+  getTSharkFields,
+  getTSharkPacketDetail,
+  analyzeTSharkPcap,
+  getTSharkEndpoints,
+  getTSharkConversations,
+  getTSharkExpertInfo,
+  extractTSharkFields,
+} from "./src/server/tshark";
 
 import {
   SystemHealth,
@@ -73,6 +98,8 @@ const cyberlabDb = mysql.createPool({
   connectionLimit: 5,
   queueLimit: 0,
 });
+
+initializeCyberLabPersistence(cyberlabDb);
 
 // ============================================================
 // GLOBAL STATE
@@ -2341,11 +2368,14 @@ app.patch(
       const { alertId } = req.params;
       const { status } = req.body || {};
 
-      if (status !== "acknowledged") {
+      if (
+        status !== "acknowledged" &&
+        status !== "resolved"
+      ) {
         return res.status(400).json({
           success: false,
           error:
-            "Invalid alert status. Only acknowledged is currently supported.",
+            "Invalid alert status. Only acknowledged or resolved is supported.",
         });
       }
 
@@ -2785,6 +2815,23 @@ function countVulnerabilities(findings: VulnerabilityFinding[]) {
 // ============================================================
 // AUTHENTICATION API
 // ============================================================
+
+app.get(
+  "/api/auth/me",
+  (req, res) => {
+    if (!req.cyberLabUser) {
+      return res.status(401).json({
+        authenticated: false,
+        user: null,
+      });
+    }
+
+    return res.json({
+      authenticated: true,
+      user: req.cyberLabUser,
+    });
+  }
+);
 
 app.post("/api/auth/login", async (req, res) => {
   try {
@@ -7445,6 +7492,644 @@ app.get(
 
 
 // ============================================================
+
+
+// ============================================================
+// 14B. TSHARK ANALYSIS / CAPABILITIES API
+// ============================================================
+
+app.get(
+  "/api/integrations/tshark/protocols",
+  async (_req, res) => {
+    try {
+      const protocols =
+        await getTSharkProtocols();
+
+      return res.json({
+        status: "online",
+        protocols,
+        count: protocols.length,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to retrieve TShark protocols.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/fields",
+  async (req, res) => {
+    try {
+      const protocol =
+        typeof req.query.protocol === "string"
+          ? req.query.protocol
+          : undefined;
+
+      const search =
+        typeof req.query.search === "string"
+          ? req.query.search
+          : undefined;
+
+      const fields =
+        await getTSharkFields(
+          protocol,
+          search
+        );
+
+      return res.json({
+        status: "online",
+        fields,
+        count: fields.length,
+        protocol: protocol || null,
+        search: search || null,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to retrieve TShark fields.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/capabilities",
+  async (_req, res) => {
+    try {
+      const capabilities =
+        await getTSharkCapabilities();
+
+      return res.json({
+        status: "online",
+        capabilities,
+        count: capabilities.length,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to retrieve TShark capabilities.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/pcap/packet",
+  async (req, res) => {
+    try {
+      const file =
+        typeof req.query.file === "string"
+          ? req.query.file.trim()
+          : "";
+
+      const packetNumber =
+        Number(req.query.packet);
+
+      if (!file) {
+        return res.status(400).json({
+          error:
+            "A capture file path is required.",
+        });
+      }
+
+      if (
+        !Number.isInteger(packetNumber) ||
+        packetNumber < 1
+      ) {
+        return res.status(400).json({
+          error:
+            "A valid packet number is required.",
+        });
+      }
+
+      const packet =
+        await getTSharkPacketDetail(
+          file,
+          packetNumber
+        );
+
+      return res.json({
+        status: "online",
+        packet,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to inspect packet.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/pcap/analyze",
+  async (req, res) => {
+    try {
+      const file =
+        typeof req.query.file === "string"
+          ? req.query.file.trim()
+          : "";
+
+      if (!file) {
+        return res.status(400).json({
+          error:
+            "A capture file path is required.",
+        });
+      }
+
+      const analysis =
+        await analyzeTSharkPcap(file);
+
+      return res.json({
+        status: "online",
+        analysis,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to analyze capture file.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/pcap/endpoints",
+  async (req, res) => {
+    try {
+      const file =
+        typeof req.query.file === "string"
+          ? req.query.file.trim()
+          : "";
+
+      const protocol =
+        typeof req.query.protocol === "string"
+          ? req.query.protocol.trim()
+          : undefined;
+
+      if (!file) {
+        return res.status(400).json({
+          error:
+            "A capture file path is required.",
+        });
+      }
+
+      const output =
+        await getTSharkEndpoints(
+          file,
+          protocol
+        );
+
+      return res.json({
+        status: "online",
+        file,
+        protocol: protocol || "ip",
+        output,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to retrieve endpoints.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/pcap/conversations",
+  async (req, res) => {
+    try {
+      const file =
+        typeof req.query.file === "string"
+          ? req.query.file.trim()
+          : "";
+
+      const protocol =
+        typeof req.query.protocol === "string"
+          ? req.query.protocol.trim()
+          : undefined;
+
+      if (!file) {
+        return res.status(400).json({
+          error:
+            "A capture file path is required.",
+        });
+      }
+
+      const output =
+        await getTSharkConversations(
+          file,
+          protocol
+        );
+
+      return res.json({
+        status: "online",
+        file,
+        protocol: protocol || "ip",
+        output,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to retrieve conversations.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/pcap/expert",
+  async (req, res) => {
+    try {
+      const file =
+        typeof req.query.file === "string"
+          ? req.query.file.trim()
+          : "";
+
+      if (!file) {
+        return res.status(400).json({
+          error:
+            "A capture file path is required.",
+        });
+      }
+
+      const output =
+        await getTSharkExpertInfo(file);
+
+      return res.json({
+        status: "online",
+        file,
+        output,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to retrieve expert information.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/tshark/pcap/extract",
+  async (req, res) => {
+    try {
+      const {
+        file,
+        fields,
+        displayFilter,
+      } = req.body || {};
+
+      if (
+        typeof file !== "string" ||
+        !file.trim()
+      ) {
+        return res.status(400).json({
+          error:
+            "A capture file path is required.",
+        });
+      }
+
+      if (
+        !Array.isArray(fields) ||
+        fields.length === 0 ||
+        fields.some(
+          (field: unknown) =>
+            typeof field !== "string"
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            "At least one valid TShark field is required.",
+        });
+      }
+
+      const rows =
+        await extractTSharkFields(
+          file.trim(),
+          fields,
+          typeof displayFilter === "string"
+            ? displayFilter
+            : undefined
+        );
+
+      return res.json({
+        status: "online",
+        file: file.trim(),
+        fields,
+        displayFilter:
+          typeof displayFilter === "string"
+            ? displayFilter
+            : "",
+        rows,
+        count: rows.length,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to extract TShark fields.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+// ============================================================
+// 14C. TSHARK PACKET CAPTURE API
+// ============================================================
+
+app.get(
+  "/api/integrations/tshark/status",
+  async (_req, res) => {
+    try {
+      const version = await getTSharkVersion();
+
+      return res.json({
+        status: "online",
+        version,
+        capture: getTSharkCaptureState(),
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to execute TShark.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/interfaces",
+  async (_req, res) => {
+    try {
+      const interfaces =
+        await getTSharkInterfaces();
+
+      return res.json({
+        status: "online",
+        interfaces,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "offline",
+        error:
+          err?.message ||
+          "Unable to retrieve TShark interfaces.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/tshark/capture/start",
+  async (req, res) => {
+    try {
+      const {
+        interface: interfaceName,
+        count,
+        captureFilter,
+      } = req.body || {};
+
+      const selectedInterface =
+        typeof interfaceName === "string" &&
+        interfaceName.trim()
+          ? interfaceName.trim()
+          : "any";
+
+      const packetCount = Math.min(
+        Math.max(
+          Number(count) || 100,
+          1
+        ),
+        5000
+      );
+
+      const selectedCaptureFilter =
+        typeof captureFilter === "string"
+          ? captureFilter.trim()
+          : "";
+
+      const interfaces =
+        await getTSharkInterfaces();
+
+      const interfaceExists =
+        interfaces.some(
+          (item) =>
+            item.name === selectedInterface
+        );
+
+      if (!interfaceExists) {
+        return res.status(400).json({
+          error:
+            `Invalid TShark interface: ${selectedInterface}`,
+        });
+      }
+
+      const capture =
+        startTSharkCapture({
+          interface: selectedInterface,
+          count: packetCount,
+          captureFilter:
+            selectedCaptureFilter,
+          emitEvent: recordCyberLabEvent,
+        });
+
+      recordCyberLabEvent({
+        type: "tshark.capture.started",
+        source: "TShark",
+        severity: "info",
+        title: "TShark packet capture started",
+        message:
+          `Packet capture started on ${selectedInterface}.`,
+        target: selectedInterface,
+        metadata: {
+          interface: selectedInterface,
+          count: packetCount,
+          captureFilter:
+            selectedCaptureFilter || null,
+          pid: capture.pid,
+        },
+      });
+
+      return res.json({
+        status: "started",
+        capture,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Failed to start TShark capture.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/tshark/capture/stop",
+  async (_req, res) => {
+    try {
+      const before =
+        getTSharkCaptureState();
+
+      const capture =
+        stopTSharkCapture();
+
+      if (before.running) {
+        recordCyberLabEvent({
+          type: "tshark.capture.stopped",
+          source: "TShark",
+          severity: "info",
+          title: "TShark packet capture stopped",
+          message:
+            `Packet capture stopped on ${before.interface}.`,
+          target: before.interface,
+          metadata: {
+            interface: before.interface,
+            packetCount:
+              before.packetCount,
+          },
+        });
+      }
+
+      return res.json({
+        status: "stopped",
+        capture,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Failed to stop TShark capture.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/tshark/capture/clear",
+  (_req, res) => {
+    try {
+      const capture =
+        clearTSharkCapture();
+
+      return res.json({
+        status: "cleared",
+        capture,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Failed to clear TShark capture.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/capture/status",
+  (_req, res) => {
+    return res.json({
+      capture:
+        getTSharkCaptureState(),
+      timestamp: new Date().toISOString(),
+    });
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/packets",
+  (req, res) => {
+    const displayFilter =
+      typeof req.query.filter === "string"
+        ? req.query.filter
+        : "";
+
+    const result =
+      getTSharkPackets({
+        displayFilter,
+      });
+
+    return res.json({
+      packets: result.packets,
+      packetCount:
+        result.packetCount,
+      filteredPacketCount:
+        result.packets.length,
+      running: result.running,
+      interface:
+        result.interface,
+      captureFilter:
+        result.captureFilter,
+      displayFilter:
+        result.displayFilter,
+      timestamp: new Date().toISOString(),
+    });
+  }
+);
+
+app.get(
+  "/api/integrations/tshark/statistics",
+  (_req, res) => {
+    return res.json({
+      statistics:
+        getTSharkStatistics(),
+      timestamp: new Date().toISOString(),
+    });
+  }
+);
+
 // 15. VITE / STATIC FRONTEND
 // ============================================================
 
@@ -7800,54 +8485,152 @@ async function startServer(): Promise<void> {
             30000
           );
 
-        if (
-          targetResult.statusCode < 200 ||
-          targetResult.statusCode >= 300
-        ) {
-          throw new Error(
-            "Greenbone failed to create the target."
-          );
-        }
-
         let targetId: string | null = null;
 
-        try {
-          const targetResponseParser = new XMLParser({
-            ignoreAttributes: false,
-            attributeNamePrefix: "@_",
-            trimValues: true,
-          });
+        const createTargetResponseMatch =
+          targetResult.xml.match(
+            /<create_target_response\b[^>]*\bstatus\s*=\s*["'](\d+)["'][^>]*\bstatus_text\s*=\s*["']([^"']*)["']/i
+          );
 
-          const targetResponseXml =
-            targetResponseParser.parse(
-              targetResult.xml || ""
+        const createTargetStatusCode = Number(
+          createTargetResponseMatch?.[1] ||
+          targetResult.statusCode
+        );
+
+        const createTargetStatusText =
+          createTargetResponseMatch?.[2] ||
+          targetResult.statusText ||
+          "";
+
+        if (
+          createTargetStatusCode >= 200 &&
+          createTargetStatusCode < 300
+        ) {
+          try {
+            const targetResponseParser = new XMLParser({
+              ignoreAttributes: false,
+              attributeNamePrefix: "@_",
+              trimValues: true,
+            });
+
+            const targetResponseXml =
+              targetResponseParser.parse(
+                targetResult.xml || ""
+              );
+
+            const parsedTargetId =
+              targetResponseXml
+                ?.create_target_response?.["@_id"];
+
+            if (
+              typeof parsedTargetId === "string" &&
+              parsedTargetId.trim()
+            ) {
+              targetId = parsedTargetId.trim();
+            }
+          } catch (parseError) {
+            console.error(
+              "[Telegram Greenbone] Failed to parse create_target response:",
+              parseError
             );
+          }
 
-          const parsedTargetId =
-            targetResponseXml
-              ?.create_target_response?.["@_id"];
+          if (!targetId) {
+            const targetIdMatch =
+              targetResult.xml.match(
+                /<create_target_response\b[^>]*\bid\s*=\s*["']([^"']+)["']/i
+              );
+
+            targetId =
+              targetIdMatch?.[1]?.trim() || null;
+          }
+        } else if (
+          createTargetStatusCode === 400 &&
+          /Target exists already/i.test(
+            `${createTargetStatusText} ${targetResult.xml}`
+          )
+        ) {
+          console.log(
+            `[Telegram Greenbone] Target already exists for ${trimmedTarget}; looking up existing target.`
+          );
+
+          const existingTargetsResult =
+            await runGreenboneGmpCommand(
+              `<get_targets details="1"/>`,
+              30000
+            );
 
           if (
-            typeof parsedTargetId === "string" &&
-            parsedTargetId.trim()
+            existingTargetsResult.statusCode < 200 ||
+            existingTargetsResult.statusCode >= 300
           ) {
-            targetId = parsedTargetId.trim();
-          }
-        } catch (parseError) {
-          console.error(
-            "[Telegram Greenbone] Failed to parse create_target response:",
-            parseError
-          );
-        }
-
-        if (!targetId) {
-          const targetIdMatch =
-            targetResult.xml.match(
-              /<create_target_response\b[^>]*\bid\s*=\s*["']([^"']+)["']/i
+            throw new Error(
+              existingTargetsResult.statusText ||
+              "Greenbone reported that the target exists, but existing targets could not be retrieved."
             );
+          }
 
-          targetId =
-            targetIdMatch?.[1]?.trim() || null;
+          try {
+            const targetsParser = new XMLParser({
+              ignoreAttributes: false,
+              attributeNamePrefix: "@_",
+              trimValues: true,
+              isArray: (tagName) =>
+                tagName === "target",
+            });
+
+            const targetsXml =
+              targetsParser.parse(
+                existingTargetsResult.xml || ""
+              );
+
+            const targets =
+              targetsXml?.get_targets_response?.target || [];
+
+            const normalizedRequestedTarget =
+              trimmedTarget.trim().toLowerCase();
+
+            const matchingTarget =
+              targets.find((candidate: any) => {
+                const hosts =
+                  typeof candidate?.hosts === "string"
+                    ? candidate.hosts.trim()
+                    : "";
+
+                if (!hosts) {
+                  return false;
+                }
+
+                const hostList = hosts
+                  .split(/[,\s]+/)
+                  .map((host: string) =>
+                    host.trim().toLowerCase()
+                  )
+                  .filter(Boolean);
+
+                return hostList.includes(
+                  normalizedRequestedTarget
+                );
+              });
+
+            const existingTargetId =
+              typeof matchingTarget?.["@_id"] === "string"
+                ? matchingTarget["@_id"].trim()
+                : "";
+
+            if (existingTargetId) {
+              targetId = existingTargetId;
+
+              console.log(
+                `[Telegram Greenbone] Reusing existing target ${existingTargetId} for ${trimmedTarget}.`
+              );
+            }
+          } catch (parseError) {
+            console.error(
+              "[Telegram Greenbone] Failed to parse existing targets response:",
+              parseError
+            );
+          }
         }
 
         if (!targetId) {
@@ -7857,7 +8640,8 @@ async function startServer(): Promise<void> {
           );
 
           throw new Error(
-            "Greenbone created the target but did not return a target ID."
+            targetResult.statusText ||
+            "Greenbone failed to create or locate the target."
           );
         }
 
@@ -7952,7 +8736,107 @@ async function startServer(): Promise<void> {
       }
     );
 
+    registerTelegramTSharkProvider({
+      getStatus: () => {
+        const state = getTSharkCaptureState();
+
+        return {
+          running: state.running,
+          interface: state.interface,
+          packetCount: state.packetCount,
+          captureFilter: state.captureFilter,
+          pid: state.pid,
+          startedAt: state.startedAt,
+        };
+      },
+
+      start: () => {
+        const existingState = getTSharkCaptureState();
+
+        if (existingState.running) {
+          return {
+            running: existingState.running,
+            interface: existingState.interface,
+            packetCount: existingState.packetCount,
+            captureFilter: existingState.captureFilter,
+            pid: existingState.pid,
+            startedAt: existingState.startedAt,
+          };
+        }
+
+        const selectedInterface = "any";
+        const packetCount = 100;
+        const selectedCaptureFilter = "";
+
+        const capture = startTSharkCapture({
+          interface: selectedInterface,
+          count: packetCount,
+          captureFilter: selectedCaptureFilter,
+          emitEvent: recordCyberLabEvent,
+        });
+
+        recordCyberLabEvent({
+          type: "tshark.capture.started",
+          source: "TShark",
+          severity: "info",
+          title: "TShark packet capture started",
+          message:
+            `Packet capture started on ${selectedInterface} from Telegram.`,
+          target: selectedInterface,
+          metadata: {
+            interface: selectedInterface,
+            count: packetCount,
+            captureFilter:
+              selectedCaptureFilter || null,
+            pid: capture.pid,
+            source: "telegram",
+          },
+        });
+
+        const state = getTSharkCaptureState();
+
+        return {
+          running: state.running,
+          interface: state.interface,
+          packetCount: state.packetCount,
+          captureFilter: state.captureFilter,
+          pid: state.pid,
+          startedAt: state.startedAt,
+        };
+      },
+
+      stop: () => {
+        const existingState = getTSharkCaptureState();
+
+        if (!existingState.running) {
+          return {
+            running: existingState.running,
+            interface: existingState.interface,
+            packetCount: existingState.packetCount,
+            captureFilter: existingState.captureFilter,
+            pid: existingState.pid,
+            startedAt: existingState.startedAt,
+          };
+        }
+
+        stopTSharkCapture();
+
+        const state = getTSharkCaptureState();
+
+        return {
+          running: state.running,
+          interface: state.interface,
+          packetCount: state.packetCount,
+          captureFilter: state.captureFilter,
+          pid: state.pid,
+          startedAt: state.startedAt,
+        };
+      },
+    });
+
     startGreenboneAlertMonitor();
+
+    await loadPersistedCyberLabAlerts();
 
     void startTelegramCommandListener();
 

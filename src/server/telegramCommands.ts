@@ -5,6 +5,8 @@ import {
 import {
   getCyberLabAlerts,
   getCyberLabAlertStats,
+  getCyberLabAlertById,
+  updateCyberLabAlertStatus,
 } from "./alertEngine";
 
 import {
@@ -70,6 +72,36 @@ export function registerTelegramGreenboneScanProvider(
   ) => Promise<TelegramGreenboneScanResult>
 ): void {
   greenboneScanProvider = provider;
+}
+
+export interface TelegramTSharkStatus {
+  running: boolean;
+  interface: string;
+  packetCount: number;
+  captureFilter: string;
+  pid: number | null;
+  startedAt: string | null;
+}
+
+export interface TelegramTSharkProvider {
+  getStatus: () =>
+    | TelegramTSharkStatus
+    | Promise<TelegramTSharkStatus>;
+  start: () =>
+    | TelegramTSharkStatus
+    | Promise<TelegramTSharkStatus>;
+  stop: () =>
+    | TelegramTSharkStatus
+    | Promise<TelegramTSharkStatus>;
+}
+
+let tsharkProvider:
+  TelegramTSharkProvider | null = null;
+
+export function registerTelegramTSharkProvider(
+  provider: TelegramTSharkProvider
+): void {
+  tsharkProvider = provider;
 }
 
 interface TelegramUpdate {
@@ -295,6 +327,17 @@ async function handleTelegramCommand(
           "/alerts - Active security alerts",
           "/scans - Recent scan activity",
           "",
+          "📡 TSHARK / PACKET CAPTURE",
+          "/tshark - Show TShark capture status",
+          "/tshark start - Start packet capture",
+          "/tshark stop - Stop packet capture",
+          "",
+          "🚨 ALERT MANAGEMENT",
+          "/alerts - Show recent alerts and Alert IDs",
+          "/alert <id> - Show alert details",
+          "/alert <id> acknowledge - Acknowledge an alert",
+          "/alert <id> resolve - Resolve an alert",
+          "",
           "🛡 GREENBONE / OPENVAS",
           "/greenbone - Greenbone scan status",
           "/greenbone-scan <target> - Start a vulnerability scan",
@@ -309,6 +352,9 @@ async function handleTelegramCommand(
           "/status",
           "/health",
           "/alerts",
+          "/tshark",
+          "/tshark start",
+          "/tshark stop",
           "/scans",
           "/greenbone",
           "/greenbone-scan 45.222.128.31",
@@ -422,6 +468,303 @@ async function handleTelegramCommand(
           ].join("\n")
         );
       }
+
+      return;
+    }
+
+    case "/tshark": {
+      const firstLine = lines[0].trim();
+      const action = firstLine
+        .slice("/tshark".length)
+        .trim()
+        .toLowerCase();
+
+      if (!tsharkProvider) {
+        await sendCommandResponse(
+          chatId,
+          [
+            "📡 TSHARK",
+            "",
+            "TShark integration is not available right now.",
+            "Please check the CyberLab server configuration.",
+          ].join("\n")
+        );
+        return;
+      }
+
+      try {
+        if (action === "start") {
+          const current = await tsharkProvider.getStatus();
+
+          if (current.running) {
+            await sendCommandResponse(
+              chatId,
+              [
+                "📡 TSHARK CAPTURE",
+                "",
+                "Capture is already RUNNING.",
+                `Interface: ${current.interface}`,
+                `Packets: ${current.packetCount}`,
+                `PID: ${current.pid ?? "N/A"}`,
+                "",
+                "Use /tshark stop to stop the current capture.",
+              ].join("\n")
+            );
+            return;
+          }
+
+          const status = await tsharkProvider.start();
+
+          await sendCommandResponse(
+            chatId,
+            [
+              "📡 TSHARK CAPTURE STARTED",
+              "",
+              `Status: ${status.running ? "RUNNING" : "IDLE"}`,
+              `Interface: ${status.interface}`,
+              `Packets: ${status.packetCount}`,
+              `Capture filter: ${
+                status.captureFilter || "None"
+              }`,
+              `PID: ${status.pid ?? "N/A"}`,
+              `Started: ${status.startedAt ?? "N/A"}`,
+            ].join("\n")
+          );
+          return;
+        }
+
+        if (action === "stop") {
+          const current = await tsharkProvider.getStatus();
+
+          if (!current.running) {
+            await sendCommandResponse(
+              chatId,
+              [
+                "📡 TSHARK CAPTURE",
+                "",
+                "No TShark capture is currently running.",
+                `Last interface: ${current.interface}`,
+                `Packets recorded: ${current.packetCount}`,
+              ].join("\n")
+            );
+            return;
+          }
+
+          const status = await tsharkProvider.stop();
+
+          await sendCommandResponse(
+            chatId,
+            [
+              "📡 TSHARK CAPTURE STOPPED",
+              "",
+              `Status: ${status.running ? "RUNNING" : "IDLE"}`,
+              `Interface: ${status.interface}`,
+              `Packets recorded: ${status.packetCount}`,
+              `Capture filter: ${
+                status.captureFilter || "None"
+              }`,
+              `PID: ${status.pid ?? "N/A"}`,
+            ].join("\n")
+          );
+          return;
+        }
+
+        if (action) {
+          await sendCommandResponse(
+            chatId,
+            [
+              "📡 TSHARK",
+              "",
+              `Unknown TShark action: ${action}`,
+              "",
+              "Available actions:",
+              "/tshark",
+              "/tshark start",
+              "/tshark stop",
+            ].join("\n")
+          );
+          return;
+        }
+
+        const status = await tsharkProvider.getStatus();
+
+        await sendCommandResponse(
+          chatId,
+          [
+            "📡 TSHARK STATUS",
+            "",
+            `Status: ${status.running ? "RUNNING" : "IDLE"}`,
+            `Interface: ${status.interface}`,
+            `Packets: ${status.packetCount}`,
+            `Capture filter: ${
+              status.captureFilter || "None"
+            }`,
+            `PID: ${status.pid ?? "N/A"}`,
+            `Started: ${status.startedAt ?? "N/A"}`,
+            "",
+            "Commands:",
+            "/tshark start",
+            "/tshark stop",
+          ].join("\n")
+        );
+      } catch (error) {
+        console.error(
+          "[Telegram Commands] TShark command failed:",
+          error
+        );
+
+        await sendCommandResponse(
+          chatId,
+          [
+            "❌ TSHARK COMMAND FAILED",
+            "",
+            error instanceof Error
+              ? error.message
+              : "An unexpected TShark error occurred.",
+          ].join("\n")
+        );
+      }
+
+      return;
+    }
+
+    case "/alert": {
+      const firstLine = lines[0].trim();
+      const argumentsText = firstLine
+        .slice("/alert".length)
+        .trim();
+
+      const argumentsList = argumentsText
+        ? argumentsText.split(/\s+/)
+        : [];
+
+      const alertId = argumentsList[0]?.trim() || "";
+      const action =
+        argumentsList[1]?.trim().toLowerCase() || "";
+
+      if (!alertId) {
+        await sendCommandResponse(
+          chatId,
+          [
+            "🚨 ALERT COMMAND",
+            "",
+            "An Alert ID is required.",
+            "",
+            "Use /alerts first to see the exact Alert ID.",
+            "",
+            "Examples:",
+            "/alert ALERT_ID",
+            "/alert ALERT_ID acknowledge",
+            "/alert ALERT_ID resolve",
+          ].join("\n")
+        );
+        return;
+      }
+
+      const alert = getCyberLabAlertById(alertId);
+
+      if (!alert) {
+        await sendCommandResponse(
+          chatId,
+          [
+            "❌ ALERT NOT FOUND",
+            "",
+            `Alert ID: ${alertId}`,
+            "",
+            "Use /alerts to see the currently available Alert IDs.",
+          ].join("\n")
+        );
+        return;
+      }
+
+      if (!action) {
+        await sendCommandResponse(
+          chatId,
+          [
+            "🚨 CYBERLAB ALERT",
+            "",
+            `Alert ID: ${alert.id}`,
+            `Status: ${alert.status.toUpperCase()}`,
+            `Severity: ${alert.severity.toUpperCase()}`,
+            `Priority: ${alert.priority}`,
+            `Title: ${alert.title}`,
+            `Message: ${alert.message}`,
+            `Source: ${alert.source}`,
+            `Type: ${alert.type}`,
+            alert.target
+              ? `Target: ${alert.target}`
+              : "",
+            alert.acknowledgedAt
+              ? `Acknowledged: ${alert.acknowledgedAt}`
+              : "Acknowledged: No",
+            alert.resolvedAt
+              ? `Resolved: ${alert.resolvedAt}`
+              : "Resolved: No",
+            "",
+            "Actions:",
+            `/alert ${alert.id} acknowledge`,
+            `/alert ${alert.id} resolve`,
+          ]
+            .filter(Boolean)
+            .join("\n")
+        );
+        return;
+      }
+
+      if (
+        action !== "acknowledge" &&
+        action !== "resolve"
+      ) {
+        await sendCommandResponse(
+          chatId,
+          [
+            "❌ INVALID ALERT ACTION",
+            "",
+            `Alert ID: ${alert.id}`,
+            "",
+            "Available actions:",
+            `/alert ${alert.id} acknowledge`,
+            `/alert ${alert.id} resolve`,
+          ].join("\n")
+        );
+        return;
+      }
+
+      const updatedAlert =
+        updateCyberLabAlertStatus(
+          alert.id,
+          action === "acknowledge"
+            ? "acknowledged"
+            : "resolved"
+        );
+
+      if (!updatedAlert) {
+        await sendCommandResponse(
+          chatId,
+          [
+            "❌ ALERT UPDATE FAILED",
+            "",
+            `Alert ID: ${alert.id}`,
+            "The alert could not be updated.",
+          ].join("\n")
+        );
+        return;
+      }
+
+      await sendCommandResponse(
+        chatId,
+        [
+          action === "acknowledge"
+            ? "✅ ALERT ACKNOWLEDGED"
+            : "✅ ALERT RESOLVED",
+          "",
+          `Alert ID: ${updatedAlert.id}`,
+          `Title: ${updatedAlert.title}`,
+          `Status: ${updatedAlert.status.toUpperCase()}`,
+          "",
+          "The updated alert status has been persisted.",
+        ].join("\n")
+      );
 
       return;
     }
@@ -849,6 +1192,7 @@ async function handleTelegramCommand(
           lines.push(
             "",
             `${emoji} ${alert.severity.toUpperCase()}`,
+            `Alert ID: ${alert.id}`,
             `${alert.title}`,
             `Status: ${alert.status.toUpperCase()}`,
             alert.target
@@ -876,8 +1220,14 @@ async function handleTelegramCommand(
           "",
           "Available commands:",
           "/status",
+          "/health",
           "/alerts",
+          "/alert <id> [acknowledge|resolve]",
+          "/tshark [start|stop]",
           "/scans",
+          "/greenbone",
+          "/greenbone-scan <target>",
+          "/ai <question>",
         ].join("\n")
       );
       return;
