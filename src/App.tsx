@@ -20,6 +20,7 @@ import { WebAuditor } from "./components/WebAuditor";
 import { TerminalRunner } from "./components/TerminalRunner";
 import { VulnerabilityRemediation } from "./components/VulnerabilityRemediation";
 import { ReportGenerator } from "./components/ReportGenerator";
+import { ReportAILibrary } from "./components/ReportAILibrary";
 import { KaliMigrationGuide } from "./components/KaliMigrationGuide";
 import { PythonEngineViewer } from "./components/PythonEngineViewer";
 import { ScanHistoryDrawer } from "./components/ScanHistoryDrawer";
@@ -35,6 +36,7 @@ import { CyberLabHome } from "./components/CyberLabHome";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>("home");
+  const [showReportAILibrary, setShowReportAILibrary] = useState<boolean>(false);
 
   // CyberLab Authentication
   const [authUser, setAuthUser] = useState<any>(null);
@@ -606,12 +608,25 @@ export default function App() {
         )}
 
         {activeTab === "reports" && (
-          <ReportGenerator
-            report={report}
-            onGenerateReport={handleGenerateReport}
-            isLoading={isReportLoading}
-            activeFindingsCount={vulnerabilities.length}
-          />
+          <>
+            {showReportAILibrary ? (
+              <ReportAILibrary
+                onBack={() =>
+                  setShowReportAILibrary(false)
+                }
+              />
+            ) : (
+              <ReportGenerator
+                report={report}
+                onGenerateReport={handleGenerateReport}
+                isLoading={isReportLoading}
+                activeFindingsCount={vulnerabilities.length}
+                onOpenReportAILibrary={() =>
+                  setShowReportAILibrary(true)
+                }
+              />
+            )}
+          </>
         )}
 
         {activeTab === "python" && (

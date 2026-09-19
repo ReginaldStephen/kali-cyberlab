@@ -30,6 +30,7 @@ interface ReportGeneratorProps {
   onGenerateReport: (scope: string) => Promise<void>;
   isLoading: boolean;
   activeFindingsCount: number;
+  onOpenReportAILibrary?: () => void;
 }
 
 export const ReportGenerator: React.FC<ReportGeneratorProps> = ({
@@ -37,6 +38,7 @@ export const ReportGenerator: React.FC<ReportGeneratorProps> = ({
   onGenerateReport,
   isLoading,
   activeFindingsCount,
+  onOpenReportAILibrary,
 }) => {
   const [scopeInput, setScopeInput] = useState(
     "Kali CyberLab Infrastructure & Target Network"
@@ -272,6 +274,16 @@ export const ReportGenerator: React.FC<ReportGeneratorProps> = ({
             </div>
 
             <div className="flex items-center gap-2">
+              {onOpenReportAILibrary && (
+                <button
+                  onClick={onOpenReportAILibrary}
+                  className="flex items-center gap-1.5 rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-[10px] uppercase font-bold text-emerald-300 hover:bg-emerald-500/20 hover:text-emerald-200 cursor-pointer"
+                >
+                  <Layers className="h-3.5 w-3.5" />
+                  REPORT AI LIBRARY
+                </button>
+              )}
+
               <button
                 onClick={handlePrint}
                 className="flex items-center gap-1.5 rounded border border-slate-800 bg-slate-950 px-3 py-1.5 text-[10px] uppercase font-bold text-slate-300 hover:bg-slate-800 hover:text-white cursor-pointer"

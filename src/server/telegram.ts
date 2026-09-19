@@ -69,6 +69,75 @@ export async function sendTelegramMessage(
   }
 }
 
+export async function sendTelegramDocument(
+  document: Buffer,
+  filename: string,
+  caption?: string,
+  chatIdOverride?: number
+): Promise<boolean> {
+  const config = getTelegramConfig();
+
+  if (!config) {
+    console.warn(
+      "[Telegram] Telegram configuration is missing."
+    );
+    return false;
+  }
+
+  try {
+    const form = new FormData();
+
+    form.append(
+      "chat_id",
+      String(chatIdOverride ?? config.chatId)
+    );
+
+    form.append(
+      "document",
+      new Blob(
+        [document],
+        { type: "application/pdf" }
+      ),
+      filename
+    );
+
+    if (caption) {
+      form.append("caption", caption);
+    }
+
+    const response = await fetch(
+      `${TELEGRAM_API_BASE}/bot${config.token}/sendDocument`,
+      {
+        method: "POST",
+        body: form,
+      }
+    );
+
+    const result = await response.json();
+
+    if (!response.ok || !result.ok) {
+      console.error(
+        "[Telegram] Failed to send document:",
+        result
+      );
+      return false;
+    }
+
+    console.log(
+      `[Telegram] Document sent successfully: ${filename}`
+    );
+
+    return true;
+  } catch (error) {
+    console.error(
+      "[Telegram] Document request failed:",
+      error
+    );
+
+    return false;
+  }
+}
+
 export async function sendCyberLabAlertToTelegram(
   alert: CyberLabAlert
 ): Promise<boolean> {

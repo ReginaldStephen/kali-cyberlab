@@ -1,5 +1,6 @@
 import {
   sendTelegramMessage,
+  sendTelegramDocument,
 } from "./telegram";
 
 import {
@@ -14,6 +15,11 @@ import {
 } from "./ai";
 
 import type { ScanRunRecord } from "../types";
+
+import {
+  getCyberLabReport,
+  exportCyberLabReportPdf,
+} from "./reportAI";
 
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 
@@ -1153,6 +1159,132 @@ async function handleTelegramCommand(
         chatId,
         lines.join("\n")
       );
+
+      return;
+    }
+
+    case "/report": {
+      const firstLine = lines[0].trim();
+      const reportId = firstLine
+        .slice("/report".length)
+        .trim();
+
+      if (!reportId) {
+        await sendCommandResponse(
+          chatId,
+          [
+            "📄 CYBERLAB PDF REPORT",
+            "",
+            "Usage:",
+            "/report <report-id>",
+            "",
+            "Example:",
+            "/report report-1789801200538",
+            "",
+            "Use /scans to see available scan/report IDs.",
+          ].join("\n")
+        );
+
+        return;
+      }
+
+      const report = getCyberLabReport(reportId);
+
+      if (!report) {
+        await sendCommandResponse(
+          chatId,
+          [
+            "❌ REPORT NOT FOUND",
+            "",
+            `Report ID: ${reportId}`,
+            "",
+            "The requested CyberLab report could not be found.",
+            "",
+            "Use /scans to review available scan activity.",
+          ].join("\n")
+        );
+
+        return;
+      }
+
+      try {
+        await sendCommandResponse(
+          chatId,
+          [
+            "📄 CYBERLAB PDF REPORT",
+            "",
+            `Report: ${report.id}`,
+            `Target: ${report.target}`,
+            `Risk: ${report.overallRiskLevel} (${report.riskScore}/100)`,
+            `Findings: ${report.findingCount}`,
+            `Hosts: ${report.hostCount}`,
+            `Open Ports: ${report.openPortCount}`,
+            "",
+            "Generating and attaching the downloadable PDF report now...",
+          ].join("\n")
+        );
+
+        const pdfBuffer =
+          await exportCyberLabReportPdf(
+            report
+          );
+
+        const filename =
+          `${report.id}.pdf`;
+
+        const caption = [
+          "📄 CyberLab PDF Security Report",
+          "",
+          `Report: ${report.id}`,
+          `Target: ${report.target}`,
+          `Risk: ${report.overallRiskLevel} (${report.riskScore}/100)`,
+          `Findings: ${report.findingCount}`,
+          `Hosts: ${report.hostCount}`,
+          `Open Ports: ${report.openPortCount}`,
+          "",
+          "Download or open the attached PDF to view the complete report.",
+        ].join("\n");
+
+        const sent =
+          await sendTelegramDocument(
+            pdfBuffer,
+            filename,
+            caption,
+            chatId
+          );
+
+        if (!sent) {
+          await sendCommandResponse(
+            chatId,
+            [
+              "⚠️ PDF GENERATION COMPLETED",
+              "",
+              `Report: ${report.id}`,
+              "",
+              "The PDF was generated, but Telegram rejected the document upload.",
+              "Check the CyberLab server log for the Telegram API error.",
+            ].join("\n")
+          );
+        }
+      } catch (error) {
+        console.error(
+          "[Telegram Commands] PDF report generation failed:",
+          error
+        );
+
+        await sendCommandResponse(
+          chatId,
+          [
+            "❌ PDF REPORT FAILED",
+            "",
+            `Report: ${report.id}`,
+            "",
+            error instanceof Error
+              ? error.message
+              : "Unknown PDF generation error.",
+          ].join("\n")
+        );
+      }
 
       return;
     }

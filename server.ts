@@ -36,6 +36,14 @@ import {
 } from "./src/server/cyberlabPersistence";
 
 import {
+  listCyberLabReports,
+  getCyberLabReport,
+  getCyberLabReportRegistryPath,
+  registerCyberLabReport,
+  exportCyberLabReport,
+} from "./src/server/reportAI";
+
+import {
   getTSharkVersion,
   getTSharkInterfaces,
   getTSharkCaptureState,
@@ -83,6 +91,207 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: "2mb" }));
+
+// ============================================================
+// AUTHENTICATION MIDDLEWARE
+// ============================================================
+
+// Resolve the CyberLab session, if one exists.
+// This does NOT require authentication yet.
+app.use((req, res, next) => {
+  authenticate(
+    cyberlabDb,
+    req,
+    res,
+    next
+  ).catch(next);
+});
+
+// ============================================================
+// REPORT AI API
+// ============================================================
+
+// Report AI registry status
+app.get(
+  "/api/report-ai/status",
+  requireAuthentication,
+  requirePermission("reports.view"),
+  (_req, res) => {
+    try {
+      const reports = listCyberLabReports();
+
+      return res.json({
+        status: "online",
+        reportCount: reports.length,
+        registryPath: getCyberLabReportRegistryPath(),
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        status: "error",
+        error:
+          err?.message ||
+          "Failed to read Report AI registry.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+// List normalized CyberLab reports
+app.get(
+  "/api/report-ai/reports",
+  requireAuthentication,
+  requirePermission("reports.view"),
+  (_req, res) => {
+    try {
+      const reports = listCyberLabReports();
+
+      return res.json({
+        reports,
+        count: reports.length,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Failed to retrieve CyberLab reports.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+// Retrieve one normalized CyberLab report
+app.get(
+  "/api/report-ai/reports/:id",
+  requireAuthentication,
+  requirePermission("reports.view"),
+  (req, res) => {
+    try {
+      const report = getCyberLabReport(
+        req.params.id
+      );
+
+      if (!report) {
+        return res.status(404).json({
+          error: "Report not found.",
+        });
+      }
+
+      return res.json({
+        report,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Failed to retrieve CyberLab report.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+// Download/export one normalized CyberLab report
+app.get(
+  "/api/report-ai/reports/:id/download/:format",
+  requireAuthentication,
+  requirePermission("reports.view"),
+  async (req, res) => {
+    try {
+      const report = getCyberLabReport(
+        req.params.id
+      );
+
+      if (!report) {
+        return res.status(404).json({
+          error: "Report not found.",
+        });
+      }
+
+      const requestedFormat =
+        String(
+          req.params.format || ""
+        ).toLowerCase();
+
+      const allowedFormats = [
+        "json",
+        "markdown",
+        "html",
+        "csv",
+        "pdf",
+      ];
+
+      if (
+        !allowedFormats.includes(
+          requestedFormat
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            "Unsupported report format.",
+          supportedFormats:
+            allowedFormats,
+        });
+      }
+
+      const exported =
+        await exportCyberLabReport(
+          report,
+          requestedFormat as
+            | "json"
+            | "markdown"
+            | "html"
+            | "csv"
+            | "pdf"
+        );
+
+      const safeTitle =
+        report.title
+          .replace(
+            /[^a-zA-Z0-9._-]+/g,
+            "_"
+          )
+          .replace(
+            /^_+|_+$/g,
+            ""
+          )
+          .slice(0, 100) ||
+        "CyberLab_Report";
+
+      const filename =
+        `${safeTitle}_${report.id}.${exported.extension}`;
+
+      res.setHeader(
+        "Content-Type",
+        exported.contentType
+      );
+
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${filename}"`
+      );
+
+      res.setHeader(
+        "Cache-Control",
+        "no-store"
+      );
+
+      return res.send(
+        exported.content
+      );
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Failed to export CyberLab report.",
+      });
+    }
+  }
+);
 
 // ============================================================
 // CYBERLAB DATABASE CLIENT
@@ -555,22 +764,6 @@ function startGreenboneAlertMonitor(): void {
     "[Greenbone Monitor] Proactive alert monitoring started."
   );
 }
-
-
-// ============================================================
-// AUTHENTICATION MIDDLEWARE
-// ============================================================
-
-// Resolve the CyberLab session, if one exists.
-// This does NOT require authentication yet.
-app.use((req, res, next) => {
-  authenticate(
-    cyberlabDb,
-    req,
-    res,
-    next
-  ).catch(next);
-});
 
 
 // ============================================================
@@ -5830,6 +6023,18 @@ app.post(
       const ai =
         getGeminiClient();
 
+      // Normalize report telemetry so every section of the
+      // generated report uses the selected scan's actual values.
+      const reportPortCount =
+        selectedScan
+          ? selectedScan.openPortsTotal
+          : Number(portCount) || 0;
+
+      const reportHostCount =
+        selectedScan
+          ? selectedScan.hostsFound
+          : Number(hostCount) || 1;
+
       let allFindings:
         VulnerabilityFinding[] =
         Array.isArray(findings)
@@ -5991,7 +6196,7 @@ const topRiskAreas = deduplicatedFindings
 let summaryText =
   `The Kali CyberLab defensive security assessment was conducted against the defined scope ` +
   `'${targetScope}'. The assessment identified ${deduplicatedFindings.length} security finding(s) ` +
-  `across ${affectedTargets.length} affected target(s), with ${portCount} open port(s) observed. ` +
+  `across ${affectedTargets.length} affected target(s), with ${reportPortCount} open port(s) observed. ` +
   `The overall security posture is currently rated ${overallRisk} with a risk score of ${riskScore}/100.\n\n` +
 
   `Severity analysis identified ${criticalCount} critical, ${highCount} high, ` +
@@ -6063,7 +6268,7 @@ Target Scope:
 ${targetScope}
 
 Total Discovered Open Ports:
-${portCount}
+${reportPortCount}
 
 Vulnerabilities:
 ${JSON.stringify(
@@ -6228,14 +6433,10 @@ Prioritize defensive remediation.
 
   scope: {
     hostsScanned:
-      selectedScan
-        ? selectedScan.hostsFound
-        : Number(hostCount) || 1,
+      reportHostCount,
 
     openPorts:
-      selectedScan
-        ? selectedScan.openPortsTotal
-        : Number(portCount) || 0,
+      reportPortCount,
 
     vulnerabilities:
       deduplicatedFindings.length,
@@ -6288,6 +6489,62 @@ Prioritize defensive remediation.
         ].join("\n")
       : `Assessment generated at ${new Date().toUTCString()} on Kali Linux Host.`,
 };
+
+        // ------------------------------------------------------
+        // REPORT AI REGISTRY
+        // ------------------------------------------------------
+        // Keep the existing report response unchanged while
+        // registering a normalized copy for Report AI.
+        registerCyberLabReport({
+          id: report.id,
+          title: report.title,
+          source:
+            report.reportType === "web"
+              ? "web"
+              : selectedScan
+                ? "network"
+                : "ai-remediation",
+
+          target: report.target,
+
+          scanId:
+            report.scanId
+              ? String(report.scanId)
+              : undefined,
+
+          generatedAt: report.generatedAt,
+
+          overallRiskLevel:
+            report.overallRiskLevel,
+
+          riskScore:
+            report.riskScore,
+
+          findingCount:
+            report.findings.length,
+
+          hostCount:
+            report.scope.hostsScanned,
+
+          openPortCount:
+            report.scope.openPorts,
+
+          summary:
+            report.executiveSummary,
+
+          // These are the formats currently represented by
+          // CyberLab's report data/UI. Additional exporters
+          // will be added by the Report AI download layer.
+          availableFormats: [
+            "json",
+            "markdown",
+            "html",
+            "csv",
+            "pdf",
+          ],
+
+          reportData: report,
+        });
 
         return res.json(
         report
