@@ -2,12 +2,14 @@ import type {
   CyberLabAlert,
   CyberLabAlertStatus,
   CyberLabEvent,
+  ScanRunRecord,
 } from "../types";
 
 import type { Pool } from "mysql2/promise";
 
 const MAX_EVENTS = 200;
 const MAX_ALERTS = 200;
+const MAX_SCANS = 50;
 
 let db: Pool | null = null;
 
@@ -34,6 +36,146 @@ function toMysqlTimestamp(
     .replace("T", " ")
     .replace("Z", "")
     .slice(0, 19);
+}
+
+function parseJsonValue<T>(
+  value: unknown,
+  fallback: T
+): T {
+  if (typeof value !== "string" || !value.trim()) {
+    return fallback;
+  }
+
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+export async function persistCyberLabScan(
+  scan: ScanRunRecord
+): Promise<void> {
+  const pool = requireDb();
+
+  await pool.execute(
+    `
+      INSERT INTO cyberlab_scans (
+        scan_id,
+        scan_timestamp,
+        scan_type,
+        target,
+        command_executed,
+        duration_ms,
+        status,
+        hosts_found,
+        open_ports_total,
+        vulnerabilities_count,
+        raw_terminal_output,
+        results
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        scan_timestamp = VALUES(scan_timestamp),
+        scan_type = VALUES(scan_type),
+        target = VALUES(target),
+        command_executed = VALUES(command_executed),
+        duration_ms = VALUES(duration_ms),
+        status = VALUES(status),
+        hosts_found = VALUES(hosts_found),
+        open_ports_total = VALUES(open_ports_total),
+        vulnerabilities_count = VALUES(vulnerabilities_count),
+        raw_terminal_output = VALUES(raw_terminal_output),
+        results = VALUES(results)
+    `,
+    [
+      scan.id,
+      toMysqlTimestamp(scan.timestamp),
+      scan.type,
+      scan.target,
+      scan.commandExecuted,
+      scan.durationMs,
+      scan.status,
+      scan.hostsFound,
+      scan.openPortsTotal,
+      JSON.stringify(scan.vulnerabilitiesCount),
+      scan.rawTerminalOutput || "",
+      JSON.stringify(scan.results || {}),
+    ]
+  );
+}
+
+export async function loadCyberLabScans(
+  limit = MAX_SCANS
+): Promise<ScanRunRecord[]> {
+  const pool = requireDb();
+
+  const safeLimit = Math.min(
+    Math.max(Number(limit) || MAX_SCANS, 1),
+    MAX_SCANS
+  );
+
+  const [rows] = await pool.execute(
+    `
+      SELECT
+        scan_id,
+        scan_timestamp,
+        scan_type,
+        target,
+        command_executed,
+        duration_ms,
+        status,
+        hosts_found,
+        open_ports_total,
+        vulnerabilities_count,
+        raw_terminal_output,
+        results
+      FROM cyberlab_scans
+      ORDER BY scan_timestamp DESC, id DESC
+      LIMIT ?
+    `,
+    [safeLimit]
+  );
+
+  return (rows as Array<Record<string, unknown>>).map(
+    (row) => ({
+      id: String(row.scan_id),
+      timestamp:
+        row.scan_timestamp instanceof Date
+          ? row.scan_timestamp.toISOString()
+          : `${String(row.scan_timestamp).replace(" ", "T")}Z`,
+      type: String(row.scan_type) as ScanRunRecord["type"],
+      target: String(row.target || ""),
+      commandExecuted: String(
+        row.command_executed || ""
+      ),
+      durationMs: Number(row.duration_ms) || 0,
+      status: String(
+        row.status || "failed"
+      ) as ScanRunRecord["status"],
+      hostsFound: Number(row.hosts_found) || 0,
+      openPortsTotal:
+        Number(row.open_ports_total) || 0,
+      vulnerabilitiesCount:
+        parseJsonValue(
+          row.vulnerabilities_count,
+          {
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+            info: 0,
+          }
+        ),
+      rawTerminalOutput: String(
+        row.raw_terminal_output || ""
+      ),
+      results: parseJsonValue(
+        row.results,
+        {}
+      ),
+    })
+  );
 }
 
 export async function persistCyberLabEvent(

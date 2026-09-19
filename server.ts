@@ -33,6 +33,8 @@ import { createServer as createViteServer } from "vite";
 import { XMLParser } from "fast-xml-parser";
 import {
   initializeCyberLabPersistence,
+  loadCyberLabScans,
+  persistCyberLabScan,
 } from "./src/server/cyberlabPersistence";
 
 import {
@@ -42,6 +44,17 @@ import {
   registerCyberLabReport,
   exportCyberLabReport,
 } from "./src/server/reportAI";
+
+import {
+  getDefectDojoStatus,
+  getDefectDojoBaseUrl,
+  listDefectDojoProducts,
+  listDefectDojoEngagements,
+  listDefectDojoFindings,
+  getDefectDojoFinding,
+  importCyberLabFindingsToDefectDojo,
+  normalizeDefectDojoSeverity,
+} from "./src/server/defectDojo";
 
 import {
   getTSharkVersion,
@@ -307,8 +320,6 @@ const cyberlabDb = mysql.createPool({
   connectionLimit: 5,
   queueLimit: 0,
 });
-
-initializeCyberLabPersistence(cyberlabDb);
 
 // ============================================================
 // GLOBAL STATE
@@ -1171,6 +1182,15 @@ function addScanHistory(record: ScanRunRecord): void {
   if (scanHistory.length > 50) {
     scanHistory.pop();
   }
+
+  void persistCyberLabScan(record).catch(
+    (error) => {
+      console.error(
+        "[CyberLab Persistence] Failed to persist scan:",
+        error
+      );
+    }
+  );
 }
 
 
@@ -7449,6 +7469,264 @@ app.get(
   );
 
   // ============================================================
+
+  app.post(
+    "/api/integrations/defectdojo/sync",
+    requireAuthentication,
+    requirePermission("reports.view"),
+    async (req, res) => {
+      try {
+        const { scanId } = req.body || {};
+
+        if (!scanId || typeof scanId !== "string") {
+          return res.status(400).json({
+            error: "scanId is required.",
+          });
+        }
+
+        const scan = getScanById(scanId);
+
+        if (!scan) {
+          return res.status(404).json({
+            error: `Scan not found: ${scanId}`,
+          });
+        }
+
+        if (scan.status !== "success") {
+          return res.status(400).json({
+            error:
+              `Only completed successful scans can be synchronized. ` +
+              `Current status: ${scan.status}`,
+          });
+        }
+
+        const findings = Array.isArray(
+          scan.results?.vulnerabilities
+        )
+          ? scan.results.vulnerabilities
+          : [];
+
+        const defectDojoFindings = findings.map((finding) => ({
+          title: finding.title,
+          severity: normalizeDefectDojoSeverity(
+            finding.severity
+          ),
+          description: finding.description,
+          mitigation: finding.remediationAdvice,
+          impact: finding.impact,
+          references: Array.isArray(finding.references)
+            ? finding.references.join("\n")
+            : undefined,
+          date: finding.detectedAt || scan.timestamp,
+          cvssv3_score:
+            Number.isFinite(finding.cvssScore)
+              ? finding.cvssScore
+              : undefined,
+          unique_id_from_tool:
+            `cyberlab:${scan.id}:${finding.id}`,
+          service:
+            finding.port !== undefined
+              ? `${finding.detectedVia || "service"}:${finding.port}`
+              : finding.detectedVia || undefined,
+          active: true,
+          verified: false,
+        }));
+
+        const targetLabel =
+          scan.target.trim() || "Unknown Target";
+
+        const syncResult =
+          await importCyberLabFindingsToDefectDojo({
+            productName: "CyberLab",
+            engagementName:
+              `CyberLab Scan - ${targetLabel}`,
+            testTitle:
+              `CyberLab ${scan.type} Scan - ${scan.id}`,
+            scanType: "Generic Findings Import",
+            target: targetLabel,
+            scanId: scan.id,
+            generatedAt: scan.timestamp,
+            findings: defectDojoFindings,
+          });
+
+        return res.json({
+          success: true,
+          scan: {
+            id: scan.id,
+            target: scan.target,
+            type: scan.type,
+            status: scan.status,
+            hostsFound: scan.hostsFound,
+            openPortsTotal: scan.openPortsTotal,
+            findingCount: findings.length,
+          },
+          defectDojo: {
+            productId: syncResult.productId,
+            engagementId: syncResult.engagementId,
+            testId: syncResult.testId,
+            findingCount: syncResult.findingCount,
+            importedFindings:
+              syncResult.importedFindings,
+            message: syncResult.message,
+          },
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error(
+          "[DefectDojo Sync] Synchronization failed:",
+          error
+        );
+
+        return res.status(502).json({
+          error:
+            error instanceof Error
+              ? error.message
+              : "DefectDojo synchronization failed.",
+        });
+      }
+    }
+  );
+
+  // 14C. DEFECTDOJO API
+  // ============================================================
+
+  app.get(
+    "/api/integrations/defectdojo/status",
+    requireAuthentication,
+    requirePermission("reports.view"),
+    async (_req, res) => {
+      try {
+        const status = await getDefectDojoStatus();
+
+        return res.json({
+          ...status,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(500).json({
+          configured: Boolean(getDefectDojoBaseUrl()),
+          reachable: false,
+          authenticated: false,
+          error:
+            err?.message ||
+            "Failed to check DefectDojo status.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+  );
+
+  app.get(
+    "/api/integrations/defectdojo/products",
+    requireAuthentication,
+    requirePermission("reports.view"),
+    async (_req, res) => {
+      try {
+        const products = await listDefectDojoProducts();
+
+        return res.json({
+          products,
+          count: products.length,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(502).json({
+          error:
+            err?.message ||
+            "Failed to retrieve DefectDojo products.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+  );
+
+  app.get(
+    "/api/integrations/defectdojo/engagements",
+    requireAuthentication,
+    requirePermission("reports.view"),
+    async (_req, res) => {
+      try {
+        const engagements =
+          await listDefectDojoEngagements();
+
+        return res.json({
+          engagements,
+          count: engagements.length,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(502).json({
+          error:
+            err?.message ||
+            "Failed to retrieve DefectDojo engagements.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+  );
+
+  app.get(
+    "/api/integrations/defectdojo/findings",
+    requireAuthentication,
+    requirePermission("reports.view"),
+    async (_req, res) => {
+      try {
+        const findings = await listDefectDojoFindings();
+
+        return res.json({
+          findings,
+          count: findings.length,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(502).json({
+          error:
+            err?.message ||
+            "Failed to retrieve DefectDojo findings.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+  );
+
+  app.get(
+    "/api/integrations/defectdojo/findings/:findingId",
+    requireAuthentication,
+    requirePermission("reports.view"),
+    async (req, res) => {
+      try {
+        const findingId =
+          Number(req.params.findingId);
+
+        if (
+          !Number.isInteger(findingId) ||
+          findingId <= 0
+        ) {
+          return res.status(400).json({
+            error:
+              "A valid DefectDojo finding ID is required.",
+          });
+        }
+
+        const finding =
+          await getDefectDojoFinding(findingId);
+
+        return res.json({
+          finding,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return res.status(502).json({
+          error:
+            err?.message ||
+            "Failed to retrieve DefectDojo finding.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+  );
+
+  // ============================================================
   // 14B. GREENBONE SCAN CREATION
   // ============================================================
 
@@ -9092,6 +9370,20 @@ async function startServer(): Promise<void> {
     });
 
     startGreenboneAlertMonitor();
+
+    initializeCyberLabPersistence(
+      cyberlabDb
+    );
+
+    const persistedScans =
+      await loadCyberLabScans();
+
+    scanHistory.length = 0;
+    scanHistory.push(...persistedScans);
+
+    console.log(
+      `[CyberLab Persistence] Loaded ${persistedScans.length} persisted scan(s).`
+    );
 
     await loadPersistedCyberLabAlerts();
 
