@@ -38,6 +38,25 @@ import {
 } from "./src/server/cyberlabPersistence";
 
 import {
+  initializeWarRoomPersistence,
+  createWarRoomExercise,
+  createWarRoomPhases,
+  startWarRoomExercise,
+  transitionWarRoomPhase,
+  listWarRoomExercises,
+  getWarRoomExercise,
+  listWarRoomPhases,
+  listWarRoomEvents,
+  addWarRoomEvidence,
+  listWarRoomEvidence,
+} from "./src/server/warRoom";
+import {
+  simulateRedEvent,
+  simulateYellowEvent,
+  simulateBlueEvent,
+} from "./src/server/warRoomSimulation";
+
+import {
   listCyberLabReports,
   getCyberLabReport,
   getCyberLabReportRegistryPath,
@@ -8030,6 +8049,763 @@ app.get(
 
 
 // ============================================================
+// ============================================================
+// WAR ROOM API
+// ============================================================
+
+
+app.post(
+  "/api/war-room/exercises",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+
+      const name =
+        typeof body.name === "string"
+          ? body.name.trim()
+          : "";
+
+      const description =
+        typeof body.description === "string"
+          ? body.description.trim()
+          : undefined;
+
+      const scenarioType =
+        typeof body.scenarioType === "string"
+          ? body.scenarioType.trim()
+          : "";
+
+      const difficulty =
+        body.difficulty === "advanced"
+          ? "advanced"
+          : body.difficulty === "intermediate"
+            ? "intermediate"
+            : "beginner";
+
+      const targetScope =
+        body.targetScope &&
+        typeof body.targetScope === "object"
+          ? body.targetScope
+          : null;
+
+      const targets = Array.isArray(targetScope?.targets)
+        ? targetScope.targets
+            .filter(
+              (target: unknown): target is string =>
+                typeof target === "string"
+            )
+            .map((target: string) => target.trim())
+            .filter(Boolean)
+        : [];
+
+      if (!name) {
+        return res.status(400).json({
+          success: false,
+          error: "Exercise name is required.",
+        });
+      }
+
+      if (!scenarioType) {
+        return res.status(400).json({
+          success: false,
+          error: "Scenario type is required.",
+        });
+      }
+
+      if (targets.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: "At least one authorized target is required.",
+        });
+      }
+
+      if (targetScope?.authorized !== true) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "War Room exercises require an explicitly authorized target scope.",
+        });
+      }
+
+      const exerciseId =
+        `war-${crypto.randomUUID()}`;
+
+      const exercise =
+        await createWarRoomExercise({
+          id: exerciseId,
+          name,
+          description,
+          scenarioType,
+          difficulty,
+          targetScope: {
+            targets,
+            networks: Array.isArray(targetScope.networks)
+              ? targetScope.networks
+                  .filter(
+                    (network: unknown): network is string =>
+                      typeof network === "string"
+                  )
+                  .map((network: string) => network.trim())
+                  .filter(Boolean)
+              : undefined,
+            notes:
+              typeof targetScope.notes === "string"
+                ? targetScope.notes.trim()
+                : undefined,
+            authorized: true,
+          },
+          createdBy: req.cyberLabUser?.id,
+        });
+
+      const phases =
+        await createWarRoomPhases(exercise.id);
+
+      return res.status(201).json({
+        success: true,
+        exercise,
+        phases,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error:
+          err?.message ||
+          "Unable to create War Room exercise.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+
+
+app.get(
+  "/api/war-room/exercises",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const limit = Number(req.query.limit) || 50;
+
+      const exercises =
+        await listWarRoomExercises(limit);
+
+      return res.json({
+        success: true,
+        exercises,
+        count: exercises.length,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error:
+          err?.message ||
+          "Unable to load War Room exercises.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/war-room/exercises/:id/start",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const exercise =
+        await startWarRoomExercise(
+          String(req.params.id)
+        );
+
+      return res.json({
+        success: true,
+        exercise,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        success: false,
+        error:
+          err?.message ||
+          "Unable to start War Room exercise.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/war-room/exercises/:id/advance-phase",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const result =
+        await transitionWarRoomPhase(
+          String(req.params.id)
+        );
+
+      if (!result.completedPhase) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "No active War Room phase is available to advance.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      return res.json({
+        success: true,
+        exerciseId: String(req.params.id),
+        completedPhase:
+          result.completedPhase,
+        startedPhase:
+          result.startedPhase,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        success: false,
+        error:
+          err?.message ||
+          "Unable to advance War Room phase.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/war-room/exercises/:id/simulate",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const exerciseId =
+        String(req.params.id);
+
+      const body = req.body || {};
+
+      const model =
+        body.model === "red"
+          ? "red"
+          : body.model === "yellow"
+            ? "yellow"
+            : body.model === "blue"
+              ? "blue"
+              : null;
+
+      if (!model) {
+        return res.status(400).json({
+          success: false,
+          error:
+            'Simulation model must be "red", "yellow", or "blue".',
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const eventType =
+        typeof body.eventType === "string"
+          ? body.eventType.trim()
+          : "";
+
+      const title =
+        typeof body.title === "string"
+          ? body.title.trim()
+          : "";
+
+      const message =
+        typeof body.message === "string"
+          ? body.message.trim()
+          : "";
+
+      const target =
+        typeof body.target === "string"
+          ? body.target.trim()
+          : undefined;
+
+      const severity =
+        typeof body.severity === "string"
+          ? body.severity.trim()
+          : undefined;
+
+      const payload =
+        body.payload &&
+        typeof body.payload === "object" &&
+        !Array.isArray(body.payload)
+          ? body.payload
+          : undefined;
+
+      if (!eventType) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Simulation event type is required.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      if (!title) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Simulation event title is required.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      if (!message) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Simulation event message is required.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const input = {
+        exerciseId,
+        eventType,
+        title,
+        message,
+        target,
+        severity: severity as any,
+        payload: payload as
+          | Record<string, unknown>
+          | undefined,
+      };
+
+      const result =
+        model === "red"
+          ? await simulateRedEvent(input)
+          : model === "yellow"
+            ? await simulateYellowEvent(input)
+            : await simulateBlueEvent(input);
+
+      return res.status(201).json({
+        success: true,
+        exercise:
+          result.exercise,
+        event:
+          result.event,
+        timestamp:
+          new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        success: false,
+        error:
+          err?.message ||
+          "Unable to simulate War Room event.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/war-room/exercises/:id",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const exercise =
+        await getWarRoomExercise(
+          String(req.params.id)
+        );
+
+      if (!exercise) {
+        return res.status(404).json({
+          success: false,
+          error: "War Room exercise not found.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      return res.json({
+        success: true,
+        exercise,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error:
+          err?.message ||
+          "Unable to load War Room exercise.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/war-room/exercises/:id/phases",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const exerciseId =
+        String(req.params.id);
+
+      const exercise =
+        await getWarRoomExercise(
+          exerciseId
+        );
+
+      if (!exercise) {
+        return res.status(404).json({
+          success: false,
+          error: "War Room exercise not found.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const phases =
+        await listWarRoomPhases(
+          exerciseId
+        );
+
+      return res.json({
+        success: true,
+        exerciseId,
+        phases,
+        count: phases.length,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error:
+          err?.message ||
+          "Unable to load War Room phases.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/war-room/exercises/:id/events",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const exerciseId =
+        String(req.params.id);
+
+      const exercise =
+        await getWarRoomExercise(
+          exerciseId
+        );
+
+      if (!exercise) {
+        return res.status(404).json({
+          success: false,
+          error: "War Room exercise not found.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const limit =
+        Number(req.query.limit) || 200;
+
+      const events =
+        await listWarRoomEvents(
+          exerciseId,
+          limit
+        );
+
+      return res.json({
+        success: true,
+        exerciseId,
+        events,
+        count: events.length,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error:
+          err?.message ||
+          "Unable to load War Room events.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// WAR ROOM EVIDENCE API
+// ============================================================
+
+app.get(
+  "/api/war-room/exercises/:id/evidence",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const exerciseId =
+        String(req.params.id);
+
+      const exercise =
+        await getWarRoomExercise(
+          exerciseId
+        );
+
+      if (!exercise) {
+        return res.status(404).json({
+          success: false,
+          error: "War Room exercise not found.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const limit =
+        Number(req.query.limit) || 200;
+
+      const evidence =
+        await listWarRoomEvidence(
+          exerciseId,
+          limit
+        );
+
+      return res.json({
+        success: true,
+        exerciseId,
+        evidence,
+        count: evidence.length,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error:
+          err?.message ||
+          "Unable to load War Room evidence.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/war-room/exercises/:id/evidence",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const exerciseId =
+        String(req.params.id);
+
+      const exercise =
+        await getWarRoomExercise(
+          exerciseId
+        );
+
+      if (!exercise) {
+        return res.status(404).json({
+          success: false,
+          error: "War Room exercise not found.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const body = req.body || {};
+
+      const type =
+        typeof body.type === "string"
+          ? body.type.trim()
+          : "";
+
+      const title =
+        typeof body.title === "string"
+          ? body.title.trim()
+          : "";
+
+      const description =
+        typeof body.description === "string"
+          ? body.description.trim()
+          : undefined;
+
+      const source =
+        typeof body.source === "string"
+          ? body.source.trim()
+          : "";
+
+      const sourceId =
+        typeof body.sourceId === "string"
+          ? body.sourceId.trim()
+          : undefined;
+
+      const content =
+        typeof body.content === "string"
+          ? body.content
+          : undefined;
+
+      const artifactPath =
+        typeof body.artifactPath === "string"
+          ? body.artifactPath.trim()
+          : undefined;
+
+      const metadata =
+        body.metadata &&
+        typeof body.metadata === "object" &&
+        !Array.isArray(body.metadata)
+          ? body.metadata
+          : undefined;
+
+      const allowedTypes = new Set([
+        "event",
+        "http_request",
+        "http_response",
+        "network_capture",
+        "terminal_output",
+        "scanner_result",
+        "screenshot",
+        "artifact",
+        "remediation",
+        "retest",
+        "analyst_note",
+      ]);
+
+      const allowedSources = new Set([
+        "red",
+        "yellow",
+        "blue",
+        "burp",
+        "httpx",
+        "tshark",
+        "greenbone",
+        "terminal",
+        "defectdojo",
+        "manual",
+        "system",
+      ]);
+
+      if (!type) {
+        return res.status(400).json({
+          success: false,
+          error: "Evidence type is required.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      if (!allowedTypes.has(type)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid War Room evidence type.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      if (!title) {
+        return res.status(400).json({
+          success: false,
+          error: "Evidence title is required.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      if (title.length > 200) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Evidence title must be 200 characters or fewer.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      if (!source) {
+        return res.status(400).json({
+          success: false,
+          error: "Evidence source is required.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      if (!allowedSources.has(source)) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid War Room evidence source.",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const now =
+        new Date().toISOString();
+
+      const capturedAt =
+        typeof body.capturedAt === "string" &&
+        !Number.isNaN(
+          Date.parse(body.capturedAt)
+        )
+          ? new Date(
+              body.capturedAt
+            ).toISOString()
+          : now;
+
+      const createdAt =
+        typeof body.createdAt === "string" &&
+        !Number.isNaN(
+          Date.parse(body.createdAt)
+        )
+          ? new Date(
+              body.createdAt
+            ).toISOString()
+          : now;
+
+      const evidence = {
+        id: `evidence-${crypto.randomUUID()}`,
+        exerciseId,
+        findingId:
+          typeof body.findingId === "string" &&
+          body.findingId.trim()
+            ? body.findingId.trim()
+            : undefined,
+        type:
+          type as import("./src/types").WarRoomEvidenceType,
+        title,
+        description,
+        source:
+          source as import("./src/types").WarRoomEvidence["source"],
+        sourceId,
+        metadata,
+        content,
+        artifactPath,
+        capturedAt,
+        createdAt,
+      };
+
+      await addWarRoomEvidence(
+        evidence
+      );
+
+      return res.status(201).json({
+        success: true,
+        evidence,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        success: false,
+        error:
+          err?.message ||
+          "Unable to create War Room evidence.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+// ============================================================
+
 // 14B. TSHARK ANALYSIS / CAPABILITIES API
 // ============================================================
 
@@ -9374,6 +10150,7 @@ async function startServer(): Promise<void> {
     initializeCyberLabPersistence(
       cyberlabDb
     );
+    await initializeWarRoomPersistence(cyberlabDb);
 
     const persistedScans =
       await loadCyberLabScans();
