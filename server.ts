@@ -96,6 +96,16 @@ import {
 } from "./src/server/tshark";
 
 import {
+  getHttpxInstallation,
+  getHttpxVersion,
+  getHttpxCapabilities,
+  runHttpxProbe,
+  runHttpxBatch,
+  listHttpxResults,
+  clearHttpxResults,
+} from "./src/server/httpx";
+
+import {
   SystemHealth,
   DiscoveredHost,
   DiscoveredPort,
@@ -8049,6 +8059,299 @@ app.get(
 
 
 // ============================================================
+function buildHttpxWarRoomEvidence(
+  exerciseId: string,
+  result: import("./src/server/httpx").HttpxResult,
+) {
+  const capturedAt =
+    typeof result.timestamp === "string" &&
+    !Number.isNaN(Date.parse(result.timestamp))
+      ? result.timestamp
+      : new Date().toISOString();
+
+  const requestContent =
+    typeof result.request === "string" &&
+    result.request.trim()
+      ? result.request
+      : undefined;
+
+  return {
+    id: `evidence-${crypto.randomUUID()}`,
+    exerciseId,
+    type:
+      "http_response" as import("./src/types").WarRoomEvidenceType,
+    title:
+      `HTTPX response: ${result.finalUrl || result.url}`,
+    description:
+      `HTTPX probe result for ${result.target}`,
+    source:
+      "httpx" as import("./src/types").WarRoomEvidence["source"],
+    sourceId: result.id,
+    metadata: {
+      target: result.target,
+      url: result.url,
+      input: result.input,
+      finalUrl: result.finalUrl,
+      statusCode: result.statusCode,
+      contentLength: result.contentLength,
+      contentType: result.contentType,
+      title: result.title,
+      webServer: result.webServer,
+      method: result.method,
+      technologies: result.technologies,
+      cpe: result.cpe,
+      responseTime: result.responseTime,
+      ip: result.ip,
+      ipv4: result.ipv4,
+      ipv6: result.ipv6,
+      cname: result.cname,
+      cdn: result.cdn,
+      location: result.location,
+      probe: result.probe,
+      redirectChain: result.redirectChain,
+      responseHeaders: result.responseHeaders,
+      bodyPreview: result.bodyPreview,
+      responseEncoding: result.responseEncoding,
+      wordCount: result.wordCount,
+      lineCount: result.lineCount,
+      faviconHash: result.faviconHash,
+      faviconMd5: result.faviconMd5,
+      faviconPath: result.faviconPath,
+      faviconUrl: result.faviconUrl,
+      jarmHash: result.jarmHash,
+      http2: result.http2,
+      websocket: result.websocket,
+      tls: result.tls,
+    },
+    content: requestContent,
+    capturedAt,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+app.post(
+  "/api/integrations/httpx/probe",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const {
+        target,
+        exerciseId,
+        timeoutSeconds,
+        followRedirects,
+        techDetect,
+        inspection,
+      } = req.body || {};
+
+      if (
+        typeof target !== "string" ||
+        !target.trim()
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "A target URL is required.",
+        });
+      }
+
+      const results =
+        await runHttpxProbe(
+          target,
+          {
+            timeoutSeconds,
+            followRedirects,
+            techDetect,
+            inspection,
+          }
+        );
+
+      let evidence: Array<import("./src/types").WarRoomEvidence> = [];
+
+      if (
+        typeof exerciseId === "string" &&
+        exerciseId.trim()
+      ) {
+        const exercise =
+          await getWarRoomExercise(
+            exerciseId.trim()
+          );
+
+        if (!exercise) {
+          return res.status(400).json({
+            success: false,
+            error:
+              "The supplied War Room exercise does not exist.",
+            timestamp:
+              new Date().toISOString(),
+          });
+        }
+
+        evidence = results.map(
+          (result) =>
+            buildHttpxWarRoomEvidence(
+              exercise.id,
+              result
+            )
+        );
+
+        for (const item of evidence) {
+          await addWarRoomEvidence(item);
+        }
+      }
+
+      return res.json({
+        success: true,
+        status: "online",
+        target: target.trim(),
+        results,
+        count: results.length,
+        evidence,
+        evidenceCount: evidence.length,
+        timestamp:
+          new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        status: "offline",
+        error:
+          err?.message ||
+          "HTTPX probe failed.",
+        timestamp:
+          new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/httpx/batch",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (req, res) => {
+    try {
+      const {
+        targets,
+        exerciseId,
+        timeoutSeconds,
+        followRedirects,
+        techDetect,
+        inspection,
+      } = req.body || {};
+
+      if (!Array.isArray(targets)) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "targets must be an array.",
+        });
+      }
+
+      if (
+        targets.length === 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "At least one target is required.",
+        });
+      }
+
+      if (
+        targets.length > 50
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "A maximum of 50 targets is allowed per HTTPX batch.",
+        });
+      }
+
+      if (
+        targets.some(
+          (target: unknown) =>
+            typeof target !== "string"
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Every target must be a string.",
+        });
+      }
+
+      const results =
+        await runHttpxBatch(
+          targets,
+          {
+            timeoutSeconds,
+            followRedirects,
+            techDetect,
+            inspection,
+          }
+        );
+
+      let evidence: Array<import("./src/types").WarRoomEvidence> = [];
+
+      if (
+        typeof exerciseId === "string" &&
+        exerciseId.trim()
+      ) {
+        const exercise =
+          await getWarRoomExercise(
+            exerciseId.trim()
+          );
+
+        if (!exercise) {
+          return res.status(400).json({
+            success: false,
+            error:
+              "The supplied War Room exercise does not exist.",
+            timestamp:
+              new Date().toISOString(),
+          });
+        }
+
+        evidence = results.map(
+          (result) =>
+            buildHttpxWarRoomEvidence(
+              exercise.id,
+              result
+            )
+        );
+
+        for (const item of evidence) {
+          await addWarRoomEvidence(item);
+        }
+      }
+
+      return res.json({
+        success: true,
+        status: "online",
+        requestedTargets:
+          targets.length,
+        results,
+        count: results.length,
+        evidence,
+        evidenceCount: evidence.length,
+        timestamp:
+          new Date().toISOString(),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        status: "offline",
+        error:
+          err?.message ||
+          "HTTPX batch probe failed.",
+        timestamp:
+          new Date().toISOString(),
+      });
+    }
+  }
+);
+
 // ============================================================
 // WAR ROOM API
 // ============================================================
