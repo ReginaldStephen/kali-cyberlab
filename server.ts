@@ -6,7 +6,7 @@ import {
   updateCyberLabAlertStatus,
   loadPersistedCyberLabAlerts,
 } from "./src/server/alertEngine";
-import "dotenv/config";
+import dotenv from "dotenv";
 import {
   startTelegramCommandListener,
   registerTelegramScanHistoryProvider,
@@ -19,16 +19,45 @@ import {
   registerCyberLabAIClientProvider,
   registerCyberLabLiveContextProvider,
 } from "./src/server/ai";
+import {
+  registerCyberLabAIProvider,
+  getCyberLabAIProvider,
+  listCyberLabAIProviders,
+} from "./src/server/ai/registry";
+import {
+  getCyberLabAIRuntimeStatus,
+} from "./src/server/ai/runtime";
 import express from "express";
 import path from "path";
+import fs from "fs";
 import os from "os";
 import { exec } from "child_process";
 import http from "http";
+
+const cyberLabEnvPath = path.resolve(process.cwd(), ".env");
+const cyberLabDotenvResult = dotenv.config({
+  path: cyberLabEnvPath,
+  override: false,
+});
+
+if (cyberLabDotenvResult.error) {
+  console.warn(
+    `[CyberLab Environment] Failed to load ${cyberLabEnvPath}: ${cyberLabDotenvResult.error.message}`,
+  );
+} else {
+  console.log(
+    `[CyberLab Environment] Loaded environment from ${cyberLabEnvPath}.`,
+  );
+}
 import https from "https";
 import tls from "tls";
 import mysql from "mysql2/promise";
 import net from "net";
 import { GoogleGenAI } from "@google/genai";
+import {
+  GeminiAIProvider,
+  GEMINI_AI_MODELS,
+} from "./src/server/ai/providers/gemini";
 import { createServer as createViteServer } from "vite";
 import { XMLParser } from "fast-xml-parser";
 import {
@@ -106,6 +135,26 @@ import {
 } from "./src/server/httpx";
 
 import {
+  getBurpStatus,
+  ingestBurpHttpRecord,
+  listBurpHistory,
+  getBurpHistoryRecord,
+  getBurpRecordRepresentation,
+  listBurpSiteMap,
+  listBurpFindings,
+  listBurpInterceptQueue,
+  getBurpInterceptState,
+  setBurpInterceptEnabled,
+  createBurpInterceptedRequest,
+  updateBurpInterceptedRequest,
+  forwardBurpInterceptedRequest,
+  dropBurpInterceptedRequest,
+  listBurpScope,
+  addBurpScopeEntry,
+  deleteBurpScopeEntry,
+} from "./src/server/burp";
+
+import {
   SystemHealth,
   DiscoveredHost,
   DiscoveredPort,
@@ -131,6 +180,7 @@ import {
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const HTTPS_PORT = Number(process.env.HTTPS_PORT) || 3443;
 
 app.use(express.json({ limit: "2mb" }));
 
@@ -2679,6 +2729,38 @@ app.get(
 );
 
 // TEMPORARY: CyberLab live context inspection endpoint
+app.get(
+  "/api/ai/status",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      const providers =
+        listCyberLabAIProviders();
+
+      const runtime =
+        getCyberLabAIRuntimeStatus();
+
+      return res.json({
+        success: true,
+        providers,
+        runtime,
+      });
+    } catch (error: any) {
+      console.error(
+        "CyberLab AI status error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Failed to retrieve CyberLab AI status.",
+      });
+    }
+  }
+);
+
 app.get(
   "/api/ai/events",
   requireAuthentication,
@@ -6617,7 +6699,7 @@ app.post(
   requireAuthentication,
   async (req, res) => {
     try {
-      const { message } = req.body || {};
+      const { message, model } = req.body || {};
 
       if (
         typeof message !== "string" ||
@@ -6630,6 +6712,22 @@ app.post(
 
       const trimmedMessage = message.trim();
 
+      if (
+        model !== undefined &&
+        (typeof model !== "string" ||
+          !model.trim())
+      ) {
+        return res.status(400).json({
+          error:
+            "If provided, model must be a non-empty string.",
+        });
+      }
+
+      const requestedModel =
+        typeof model === "string"
+          ? model.trim()
+          : undefined;
+
       if (trimmedMessage.length > 4000) {
         return res.status(400).json({
           error:
@@ -6637,7 +6735,8 @@ app.post(
         });
       }
 
-      const ai = getGeminiClient();
+      const ai =
+        getCyberLabAIProvider("gemini");
 
       if (!ai) {
         return res.status(503).json({
@@ -6649,7 +6748,8 @@ app.post(
       const reply =
         await generateCyberLabAIResponse(
           ai,
-          trimmedMessage
+          trimmedMessage,
+          requestedModel
         );
 
       return res.json({
@@ -8059,6 +8159,54 @@ app.get(
 
 
 // ============================================================
+function buildBurpWarRoomEvidence(
+  exerciseId: string,
+  record: import("./src/server/burp").BurpHttpRecord,
+) {
+  const capturedAt =
+    typeof record.timestamp === "string" &&
+    !Number.isNaN(Date.parse(record.timestamp))
+      ? record.timestamp
+      : new Date().toISOString();
+
+  return {
+    id: `evidence-${crypto.randomUUID()}`,
+    exerciseId,
+    type:
+      "http_request" as import("./src/types").WarRoomEvidenceType,
+    title:
+      `Burp ${record.method} ${record.url}`,
+    description:
+      `Burp proxy transaction captured for ${record.url}`,
+    source:
+      "burp" as import("./src/types").WarRoomEvidence["source"],
+    sourceId: record.id,
+    metadata: {
+      method: record.method,
+      url: record.url,
+      status: record.status,
+      requestHeaders: record.requestHeaders,
+      responseHeaders: record.responseHeaders,
+      requestBytes: record.requestBytes,
+      responseBytes: record.responseBytes,
+      durationMs: record.durationMs,
+      mimeType: record.mimeType,
+      source: record.source,
+      targetId: record.targetId,
+      requestState: record.requestState,
+      intercepted: record.intercepted,
+      stateUpdatedAt: record.stateUpdatedAt,
+      requestBody: record.requestBody,
+      responseBody: record.responseBody,
+      rawRequest: record.rawRequest,
+      rawResponse: record.rawResponse,
+    },
+    content: record.rawRequest || record.requestBody || undefined,
+    capturedAt,
+    createdAt: new Date().toISOString(),
+  };
+}
+
 function buildHttpxWarRoomEvidence(
   exerciseId: string,
   result: import("./src/server/httpx").HttpxResult,
@@ -8128,6 +8276,955 @@ function buildHttpxWarRoomEvidence(
     createdAt: new Date().toISOString(),
   };
 }
+
+app.get(
+  "/api/integrations/burp/status",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      return res.json(
+        await getBurpStatus()
+      );
+    } catch (error: any) {
+      console.error(
+        "[Burp] Status retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error?.message ||
+          "Unable to retrieve Burp status.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/burp/bridge/traffic",
+  async (req, res) => {
+    try {
+      const expectedToken =
+        typeof process.env.CYBERLAB_BURP_BRIDGE_TOKEN === "string"
+          ? process.env.CYBERLAB_BURP_BRIDGE_TOKEN.trim()
+          : "";
+
+      const suppliedToken =
+        typeof req.headers["x-cyberlab-burp-token"] === "string"
+          ? req.headers["x-cyberlab-burp-token"].trim()
+          : "";
+
+      if (
+        !expectedToken ||
+        !suppliedToken ||
+        suppliedToken !== expectedToken
+      ) {
+        return res.status(401).json({
+          error: "Invalid or missing CyberLab Burp bridge token.",
+        });
+      }
+
+      const body = req.body || {};
+      const {
+        exerciseId,
+        id,
+        timestamp,
+        method,
+        url,
+        status,
+        requestHeaders,
+        requestBody,
+        responseHeaders,
+        responseBody,
+        requestBytes,
+        responseBytes,
+        durationMs,
+        mimeType,
+        targetId,
+        requestState,
+        rawRequest,
+        rawResponse,
+        intercepted,
+        stateUpdatedAt,
+      } = body;
+
+      if (
+        typeof url !== "string" ||
+        !url.trim()
+      ) {
+        return res.status(400).json({
+          error: "A Burp traffic URL is required.",
+        });
+      }
+
+      let exercise = null;
+
+      if (
+        typeof exerciseId === "string" &&
+        exerciseId.trim()
+      ) {
+        exercise = await getWarRoomExercise(
+          exerciseId.trim()
+        );
+
+        if (!exercise) {
+          return res.status(404).json({
+            error:
+              "The supplied War Room exercise does not exist.",
+          });
+        }
+      }
+
+      const record = ingestBurpHttpRecord({
+        id:
+          typeof id === "string" && id.trim()
+            ? id.trim()
+            : undefined,
+        timestamp:
+          typeof timestamp === "string"
+            ? timestamp
+            : undefined,
+        method:
+          typeof method === "string"
+            ? method
+            : undefined,
+        url: url.trim(),
+        status:
+          typeof status === "number" ||
+          status === null
+            ? status
+            : undefined,
+        requestHeaders:
+          requestHeaders &&
+          typeof requestHeaders === "object"
+            ? requestHeaders
+            : undefined,
+        requestBody:
+          typeof requestBody === "string"
+            ? requestBody
+            : undefined,
+        responseHeaders:
+          responseHeaders &&
+          typeof responseHeaders === "object"
+            ? responseHeaders
+            : undefined,
+        responseBody:
+          typeof responseBody === "string"
+            ? responseBody
+            : undefined,
+        requestBytes:
+          typeof requestBytes === "number"
+            ? requestBytes
+            : undefined,
+        responseBytes:
+          typeof responseBytes === "number"
+            ? responseBytes
+            : undefined,
+        durationMs:
+          typeof durationMs === "number"
+            ? durationMs
+            : undefined,
+        mimeType:
+          typeof mimeType === "string" ||
+          mimeType === null
+            ? mimeType
+            : undefined,
+        source: "burp-proxy",
+        targetId:
+          typeof targetId === "string"
+            ? targetId
+            : undefined,
+        requestState:
+          requestState === "pending" ||
+          requestState === "held" ||
+          requestState === "forwarded" ||
+          requestState === "dropped"
+            ? requestState
+            : "forwarded",
+        rawRequest:
+          typeof rawRequest === "string"
+            ? rawRequest
+            : undefined,
+        rawResponse:
+          typeof rawResponse === "string"
+            ? rawResponse
+            : undefined,
+        intercepted:
+          typeof intercepted === "boolean"
+            ? intercepted
+            : false,
+        stateUpdatedAt:
+          typeof stateUpdatedAt === "string"
+            ? stateUpdatedAt
+            : undefined,
+      });
+
+      if (!exercise) {
+        return res.status(201).json({
+          ok: true,
+          record,
+        });
+      }
+
+      const evidence =
+        await addWarRoomEvidence(
+          buildBurpWarRoomEvidence(
+            exercise.id,
+            record
+          )
+        );
+
+      return res.status(201).json({
+        ok: true,
+        record,
+        evidence,
+        evidenceCount: 1,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp Bridge] Traffic ingestion failed:",
+        error
+      );
+
+      return res.status(400).json({
+        error:
+          error?.message ||
+          "Unable to ingest Burp traffic.",
+      });
+    }
+  }
+);
+
+
+function validateBurpBridgeToken(
+  req: express.Request,
+  res: express.Response
+): boolean {
+  const expectedToken =
+    typeof process.env.CYBERLAB_BURP_BRIDGE_TOKEN === "string"
+      ? process.env.CYBERLAB_BURP_BRIDGE_TOKEN.trim()
+      : "";
+
+  const suppliedToken =
+    typeof req.headers["x-cyberlab-burp-token"] === "string"
+      ? req.headers["x-cyberlab-burp-token"].trim()
+      : "";
+
+  if (
+    !expectedToken ||
+    !suppliedToken ||
+    suppliedToken !== expectedToken
+  ) {
+    res.status(401).send(
+      "Invalid or missing CyberLab Burp bridge token."
+    );
+    return false;
+  }
+
+  return true;
+}
+
+function encodeBurpBridgeValue(
+  value: string
+): string {
+  return Buffer.from(
+    value,
+    "utf8"
+  ).toString("base64");
+}
+
+function buildBurpInterceptDecisionResponse(
+  record: any
+): string {
+  const lines: string[] = [
+    "ok=1",
+    `state=${record.requestState || "held"}`,
+    `method_b64=${encodeBurpBridgeValue(
+      typeof record.method === "string"
+        ? record.method
+        : "GET"
+    )}`,
+    `url_b64=${encodeBurpBridgeValue(
+      typeof record.url === "string"
+        ? record.url
+        : ""
+    )}`,
+    `body_b64=${encodeBurpBridgeValue(
+      typeof record.requestBody === "string"
+        ? record.requestBody
+        : ""
+    )}`,
+  ];
+
+  const headers =
+    record.requestHeaders &&
+    typeof record.requestHeaders === "object" &&
+    !Array.isArray(record.requestHeaders)
+      ? record.requestHeaders
+      : {};
+
+  for (const [name, value] of Object.entries(headers)) {
+    if (
+      typeof name !== "string" ||
+      typeof value !== "string"
+    ) {
+      continue;
+    }
+
+    lines.push(
+      `header_b64=${encodeBurpBridgeValue(name)}:${encodeBurpBridgeValue(value)}`
+    );
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+app.get(
+  "/api/integrations/burp/bridge/intercept",
+  (req, res) => {
+    if (!validateBurpBridgeToken(req, res)) {
+      return;
+    }
+
+    try {
+      const state = getBurpInterceptState();
+
+      return res.type("text/plain").send(
+        [
+          "ok=1",
+          `enabled=${state.enabled ? "1" : "0"}`,
+        ].join("\n") + "\n"
+      );
+    } catch (error: any) {
+      console.error(
+        "[Burp Bridge] Intercept state retrieval failed:",
+        error
+      );
+
+      return res.status(500).send(
+        "Unable to retrieve Burp intercept state."
+      );
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/burp/bridge/intercept/:id",
+  (req, res) => {
+    if (!validateBurpBridgeToken(req, res)) {
+      return;
+    }
+
+    try {
+      const id =
+        typeof req.params.id === "string"
+          ? req.params.id.trim()
+          : "";
+
+      if (!id) {
+        return res.status(400).send(
+          "An intercepted request ID is required."
+        );
+      }
+
+      const record =
+        getBurpHistoryRecord(id);
+
+      if (!record) {
+        return res.status(404).send(
+          "Intercepted request not found."
+        );
+      }
+
+      return res.type("text/plain").send(
+        buildBurpInterceptDecisionResponse(
+          record
+        )
+      );
+    } catch (error: any) {
+      console.error(
+        "[Burp Bridge] Intercept decision retrieval failed:",
+        error
+      );
+
+      return res.status(500).send(
+        "Unable to retrieve the Burp intercept decision."
+      );
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/burp/intercept",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      return res.json(
+        getBurpInterceptState()
+      );
+    } catch (error: any) {
+      console.error(
+        "[Burp] Intercept state retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error?.message ||
+          "Unable to retrieve Burp intercept state.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/burp/intercept",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const enabled =
+        typeof req.body?.enabled === "boolean"
+          ? req.body.enabled
+          : null;
+
+      if (enabled === null) {
+        return res.status(400).json({
+          error: "The enabled field must be a boolean.",
+        });
+      }
+
+      return res.json(
+        setBurpInterceptEnabled(enabled)
+      );
+    } catch (error: any) {
+      console.error(
+        "[Burp] Intercept state update failed:",
+        error
+      );
+
+      return res.status(400).json({
+        error:
+          error?.message ||
+          "Unable to update Burp intercept state.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/burp/intercept/queue",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      return res.json({
+        queue: listBurpInterceptQueue(),
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Intercept queue retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error?.message ||
+          "Unable to retrieve the Burp intercept queue.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/burp/intercept/queue",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+
+      if (
+        typeof body.url !== "string" ||
+        !body.url.trim()
+      ) {
+        return res.status(400).json({
+          error: "A Burp intercepted request URL is required.",
+        });
+      }
+
+      const headers =
+        body.headers &&
+        typeof body.headers === "object" &&
+        !Array.isArray(body.headers)
+          ? body.headers
+          : undefined;
+
+      const record =
+        createBurpInterceptedRequest({
+          method:
+            typeof body.method === "string"
+              ? body.method
+              : undefined,
+          url: body.url.trim(),
+          headers,
+          body:
+            typeof body.body === "string"
+              ? body.body
+              : undefined,
+          targetId:
+            typeof body.targetId === "string"
+              ? body.targetId
+              : undefined,
+        });
+
+      return res.status(201).json({
+        ok: true,
+        record,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Intercepted request creation failed:",
+        error
+      );
+
+      return res.status(400).json({
+        error:
+          error?.message ||
+          "Unable to create the intercepted request.",
+      });
+    }
+  }
+);
+
+app.put(
+  "/api/integrations/burp/intercept/queue/:id",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const id =
+        typeof req.params.id === "string"
+          ? req.params.id.trim()
+          : "";
+
+      if (!id) {
+        return res.status(400).json({
+          error: "An intercepted request ID is required.",
+        });
+      }
+
+      const body = req.body || {};
+
+      if (
+        typeof body.url !== "string" ||
+        !body.url.trim()
+      ) {
+        return res.status(400).json({
+          error: "A request URL is required.",
+        });
+      }
+
+      const headers =
+        body.headers &&
+        typeof body.headers === "object" &&
+        !Array.isArray(body.headers)
+          ? body.headers
+          : undefined;
+
+      const record =
+        updateBurpInterceptedRequest({
+          id,
+          method:
+            typeof body.method === "string"
+              ? body.method
+              : undefined,
+          url: body.url.trim(),
+          headers,
+          body:
+            typeof body.body === "string"
+              ? body.body
+              : undefined,
+        });
+
+      return res.json({
+        ok: true,
+        record,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Intercepted request update failed:",
+        error
+      );
+
+      return res.status(400).json({
+        error:
+          error?.message ||
+          "Unable to update the intercepted request.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/burp/intercept/queue/:id/forward",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const id =
+        typeof req.params.id === "string"
+          ? req.params.id.trim()
+          : "";
+
+      if (!id) {
+        return res.status(400).json({
+          error: "An intercepted request ID is required.",
+        });
+      }
+
+      const record =
+        await forwardBurpInterceptedRequest(id);
+
+      return res.json({
+        ok: true,
+        record,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Intercepted request forward failed:",
+        error
+      );
+
+      return res.status(400).json({
+        error:
+          error?.message ||
+          "Unable to forward the intercepted request.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/burp/intercept/queue/:id/drop",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const id =
+        typeof req.params.id === "string"
+          ? req.params.id.trim()
+          : "";
+
+      if (!id) {
+        return res.status(400).json({
+          error: "An intercepted request ID is required.",
+        });
+      }
+
+      const record =
+        dropBurpInterceptedRequest(id);
+
+      if (!record) {
+        return res.status(404).json({
+          error: "Intercepted request not found.",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        record,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Intercepted request drop failed:",
+        error
+      );
+
+      return res.status(400).json({
+        error:
+          error?.message ||
+          "Unable to drop the intercepted request.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/burp/scope",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      return res.json({
+        scope: listBurpScope(),
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Scope retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error?.message ||
+          "Unable to retrieve Burp scope.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/burp/scope",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+
+      if (
+        typeof body.pattern !== "string" ||
+        !body.pattern.trim()
+      ) {
+        return res.status(400).json({
+          error: "A Burp scope pattern is required.",
+        });
+      }
+
+      const entry = addBurpScopeEntry({
+        pattern: body.pattern.trim(),
+        include:
+          typeof body.include === "boolean"
+            ? body.include
+            : true,
+        notes:
+          typeof body.notes === "string"
+            ? body.notes
+            : undefined,
+      });
+
+      return res.status(201).json({
+        success: true,
+        scope: entry,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Scope creation failed:",
+        error
+      );
+
+      return res.status(400).json({
+        error:
+          error?.message ||
+          "Unable to create Burp scope entry.",
+      });
+    }
+  }
+);
+
+app.delete(
+  "/api/integrations/burp/scope/:id",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const id =
+        typeof req.params.id === "string"
+          ? req.params.id.trim()
+          : "";
+
+      if (!id) {
+        return res.status(400).json({
+          error: "A Burp scope entry ID is required.",
+        });
+      }
+
+      const deleted = deleteBurpScopeEntry(id);
+
+      if (!deleted) {
+        return res.status(404).json({
+          error: "Burp scope entry not found.",
+        });
+      }
+
+      return res.json({
+        success: true,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Scope deletion failed:",
+        error
+      );
+
+      return res.status(400).json({
+        error:
+          error?.message ||
+          "Unable to delete Burp scope entry.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/burp/history",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const rawLimit = Number(req.query.limit);
+      const limit =
+        Number.isFinite(rawLimit) && rawLimit > 0
+          ? Math.floor(rawLimit)
+          : 100;
+
+      return res.json({
+        history: listBurpHistory(limit),
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] History retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error?.message ||
+          "Unable to retrieve Burp history.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/burp/history/:id",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const id =
+        typeof req.params.id === "string"
+          ? req.params.id.trim()
+          : "";
+
+      if (!id) {
+        return res.status(400).json({
+          error: "A Burp history record ID is required.",
+        });
+      }
+
+      const record = getBurpHistoryRecord(id);
+
+      if (!record) {
+        return res.status(404).json({
+          error: "Burp history record not found.",
+        });
+      }
+
+      return res.json({
+        record,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] History record retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error?.message ||
+          "Unable to retrieve the Burp history record.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/burp/history/:id/representation",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const id =
+        typeof req.params.id === "string"
+          ? req.params.id.trim()
+          : "";
+
+      if (!id) {
+        return res.status(400).json({
+          error: "A Burp history record ID is required.",
+        });
+      }
+
+      const representation =
+        getBurpRecordRepresentation(id);
+
+      if (!representation) {
+        return res.status(404).json({
+          error: "Burp history record not found.",
+        });
+      }
+
+      return res.json(representation);
+    } catch (error: any) {
+      console.error(
+        "[Burp] Record representation retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error?.message ||
+          "Unable to retrieve the Burp record representation.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/burp/site-map",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const rawLimit = Number(req.query.limit);
+      const limit =
+        Number.isFinite(rawLimit) && rawLimit > 0
+          ? Math.floor(rawLimit)
+          : 250;
+
+      return res.json({
+        siteMap: listBurpSiteMap(limit),
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Site map retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error?.message ||
+          "Unable to retrieve the Burp site map.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/burp/findings",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const rawLimit = Number(req.query.limit);
+      const limit =
+        Number.isFinite(rawLimit) && rawLimit > 0
+          ? Math.floor(rawLimit)
+          : 100;
+
+      return res.json({
+        findings: listBurpFindings(limit),
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Findings retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error?.message ||
+          "Unable to retrieve Burp findings.",
+      });
+    }
+  }
+);
 
 app.post(
   "/api/integrations/httpx/probe",
@@ -9797,8 +10894,21 @@ async function startServer(): Promise<void> {
     // START TELEGRAM COMMAND LISTENER
     // --------------------------------------------------------
 
-    registerCyberLabAIClientProvider(
-      () => getGeminiClient()
+    registerCyberLabAIProvider({
+      id: "gemini",
+      displayName: "Google Gemini",
+      models: [...GEMINI_AI_MODELS],
+      create: () => {
+        const client = getGeminiClient();
+
+        return client
+          ? new GeminiAIProvider(client)
+          : null;
+      },
+    });
+
+    registerCyberLabAIClientProvider(() =>
+      getCyberLabAIProvider("gemini")
     );
 
     registerCyberLabLiveContextProvider(
@@ -10470,7 +11580,7 @@ async function startServer(): Promise<void> {
     void startTelegramCommandListener();
 
     // --------------------------------------------------------
-    // START HTTP SERVER
+    // START HTTP + HTTPS SERVERS
     // --------------------------------------------------------
 
     const server = app.listen(
@@ -10479,6 +11589,45 @@ async function startServer(): Promise<void> {
       () => {
         console.log(
           `Kali CyberLab Operations Suite listening on http://0.0.0.0:${PORT}`
+        );
+      }
+    );
+
+    const httpsKeyPath = path.resolve(
+      process.cwd(),
+      "certs",
+      "cyberlab-key.pem"
+    );
+
+    const httpsCertPath = path.resolve(
+      process.cwd(),
+      "certs",
+      "cyberlab-cert.pem"
+    );
+
+    if (
+      !fs.existsSync(httpsKeyPath) ||
+      !fs.existsSync(httpsCertPath)
+    ) {
+      throw new Error(
+        `HTTPS certificate files not found. Expected: ${httpsKeyPath} and ${httpsCertPath}`
+      );
+    }
+
+    const httpsServer = https.createServer(
+      {
+        key: fs.readFileSync(httpsKeyPath),
+        cert: fs.readFileSync(httpsCertPath),
+      },
+      app
+    );
+
+    httpsServer.listen(
+      HTTPS_PORT,
+      "0.0.0.0",
+      () => {
+        console.log(
+          `Kali CyberLab Operations Suite listening on https://0.0.0.0:${HTTPS_PORT}`
         );
       }
     );
@@ -10501,16 +11650,29 @@ async function startServer(): Promise<void> {
         continuousIntervalTimer = null;
       }
 
-      // Stop HTTP server.
-      server.close(
-        () => {
+      // Stop HTTP and HTTPS servers.
+      let httpClosed = false;
+      let httpsClosed = false;
+
+      const finishShutdown = () => {
+        if (httpClosed && httpsClosed) {
           console.log(
-            "[✓] Server stopped."
+            "[✓] Servers stopped."
           );
 
           process.exit(0);
         }
-      );
+      };
+
+      server.close(() => {
+        httpClosed = true;
+        finishShutdown();
+      });
+
+      httpsServer.close(() => {
+        httpsClosed = true;
+        finishShutdown();
+      });
     };
 
     // Handle Ctrl+C.
