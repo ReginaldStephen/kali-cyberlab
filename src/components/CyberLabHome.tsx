@@ -36,6 +36,7 @@ import type {
   ScanRunRecord,
   SystemHealth,
 } from "../types";
+import { OperationsReadiness } from "./OperationsReadiness";
 
 interface CyberLabHomeProps {
   systemHealth: SystemHealth | null;
@@ -309,6 +310,12 @@ export function CyberLabHome({
           onClick={() => onNavigate("arsenal")}
         />
       </div>
+
+      {/* ================================================== */}
+      {/* OPERATIONS READINESS */}
+      {/* ================================================== */}
+
+      <OperationsReadiness onNavigate={onNavigate} />
 
       {/* ================================================== */}
       {/* QUICK OPERATIONS */}

@@ -13,6 +13,7 @@ import { Home,
   Boxes,
   LogOut,
   Bell,
+  Crosshair,
 } from "lucide-react";
 
 interface NavbarProps {
@@ -48,6 +49,7 @@ const tabs = [  { id: "home", label: "Home", icon: Home },
   { id: "remediation", label: "Vulnerabilities & Fixes", icon: ShieldAlert },
   { id: "reports", label: "Executive Reports", icon: FileText },
   { id: "arsenal", label: "Security Arsenal", icon: Boxes },
+  { id: "warroom", label: "War Room", icon: Crosshair },
   { id: "activity", label: "Activity Center", icon: Bell },
   { id: "python", label: "Python Engine", icon: Code },
   { id: "migration", label: "Kali Deploy Kit", icon: DownloadCloud },

@@ -412,11 +412,18 @@ async function handleTelegramCommand(
       }
 
       try {
-        const reply =
+        const aiResponse =
           await generateCyberLabAIResponse(
             null,
             question
           );
+
+        const reply =
+          typeof aiResponse === "string"
+            ? aiResponse
+            : typeof aiResponse?.reply === "string"
+              ? aiResponse.reply
+              : "I was unable to generate a response.";
 
         await sendCommandResponse(
           chatId,
@@ -1372,6 +1379,10 @@ async function handleTelegramCommand(
 
 let polling = false;
 let offset = 0;
+
+export function isTelegramCommandListenerRunning(): boolean {
+  return polling;
+}
 
 export async function startTelegramCommandListener(): Promise<void> {
   if (polling) {

@@ -236,6 +236,15 @@ export async function listDefectDojoFindings(
   return response.results || [];
 }
 
+export async function getDefectDojoFindingCount(): Promise<number> {
+  const response =
+    await requestDefectDojo<DefectDojoListResponse<DefectDojoFinding>>(
+      "/api/v2/findings/?limit=1"
+    );
+
+  return Number(response.count || 0);
+}
+
 export async function hasDefectDojoFinding(
   uniqueIdFromTool: string
 ): Promise<boolean> {

@@ -48,12 +48,26 @@ interface TSharkPacket {
 interface TSharkCapture {
   running: boolean;
   interface: string;
+  captureFilter: string;
+  displayFilter: string;
   startedAt: string | null;
   stoppedAt: string | null;
   packetCount: number;
   packets: TSharkPacket[];
   pid: number | null;
   error: string | null;
+  durationSeconds: number | null;
+  snapshotLength: number | null;
+  bufferSizeMb: number | null;
+  promiscuous: boolean;
+  monitorMode: boolean;
+  captureFile: string | null;
+  ringBuffer: {
+    enabled: boolean;
+    fileSizeMb: number | null;
+    fileCount: number | null;
+    durationSeconds: number | null;
+  };
 }
 
 interface TSharkStatistics {
@@ -95,6 +109,25 @@ interface TSharkPcapAnalysis {
     bytes: number;
   }[];
 }
+
+interface TSharkPcapFile {
+  filename: string;
+  relativePath: string;
+  sizeBytes: number;
+  modifiedAt: string;
+  extension: ".pcap" | ".pcapng";
+}
+
+interface TSharkPcapFilesResponse {
+  status: string;
+  directory: string;
+  totalFiles: number;
+  returnedFiles: number;
+  totalBytes: number;
+  files: TSharkPcapFile[];
+  timestamp: string;
+}
+
 
 interface TSharkEndpointResult {
   file: string;
@@ -162,6 +195,38 @@ export const TSharkDashboard: React.FC<
   const [captureFilter, setCaptureFilter] =
     useState<string>("");
 
+  // Advanced TShark capture controls.
+  // PCAP recording intentionally defaults to OFF to protect storage.
+  const [durationSeconds, setDurationSeconds] =
+    useState<number>(0);
+
+  const [snapshotLength, setSnapshotLength] =
+    useState<number>(0);
+
+  const [bufferSizeMb, setBufferSizeMb] =
+    useState<number>(0);
+
+  const [promiscuous, setPromiscuous] =
+    useState<boolean>(true);
+
+  const [monitorMode, setMonitorMode] =
+    useState<boolean>(false);
+
+  const [recordPcap, setRecordPcap] =
+    useState<boolean>(false);
+
+  const [ringFileSizeMb, setRingFileSizeMb] =
+    useState<number>(0);
+
+  const [ringFileCount, setRingFileCount] =
+    useState<number>(0);
+
+  const [ringDurationSeconds, setRingDurationSeconds] =
+    useState<number>(0);
+
+  const [advancedCaptureOpen, setAdvancedCaptureOpen] =
+    useState<boolean>(false);
+
   const [displayFilter, setDisplayFilter] =
     useState<string>("");
 
@@ -186,6 +251,15 @@ export const TSharkDashboard: React.FC<
 
   // PCAP Analysis Center
   const [pcapFile, setPcapFile] =
+    useState<string>("");
+
+  const [pcapFiles, setPcapFiles] =
+    useState<TSharkPcapFile[]>([]);
+
+  const [pcapFilesLoading, setPcapFilesLoading] =
+    useState<boolean>(false);
+
+  const [pcapFilesError, setPcapFilesError] =
     useState<string>("");
 
   const [pcapAnalysis, setPcapAnalysis] =
@@ -375,6 +449,61 @@ export const TSharkDashboard: React.FC<
   };
 
 
+
+  const loadPcapFiles = useCallback(
+    async () => {
+      try {
+        setPcapFilesLoading(true);
+        setPcapFilesError("");
+
+        const response = await fetch(
+          "/api/integrations/tshark/pcap/files"
+        );
+
+        const data =
+          (await response.json()) as
+            Partial<TSharkPcapFilesResponse> & {
+              error?: string;
+            };
+
+        if (!response.ok) {
+          throw new Error(
+            data?.error ||
+              `PCAP inventory request failed: ${response.status}`
+          );
+        }
+
+        const files = Array.isArray(data.files)
+          ? data.files
+          : [];
+
+        setPcapFiles(files);
+
+        setPcapFile((currentFile) => {
+          if (
+            currentFile &&
+            files.some(
+              (file) =>
+                file.relativePath === currentFile
+            )
+          ) {
+            return currentFile;
+          }
+
+          return files[0]?.relativePath || "";
+        });
+      } catch (err: any) {
+        setPcapFiles([]);
+        setPcapFilesError(
+          err?.message ||
+            "Unable to retrieve managed PCAP files."
+        );
+      } finally {
+        setPcapFilesLoading(false);
+      }
+    },
+    []
+  );
 
   const analyzePcap = useCallback(
     async () => {
@@ -903,6 +1032,18 @@ export const TSharkDashboard: React.FC<
             packets: [],
             pid: null,
             error: null,
+            durationSeconds: null,
+            snapshotLength: null,
+            bufferSizeMb: null,
+            promiscuous: true,
+            monitorMode: false,
+            captureFile: null,
+            ringBuffer: {
+              enabled: false,
+              fileSizeMb: null,
+              fileCount: null,
+              durationSeconds: null,
+            },
           }),
           running: Boolean(data.running),
           interface:
@@ -919,6 +1060,52 @@ export const TSharkDashboard: React.FC<
             "",
           packetCount:
             Number(data.packetCount) || 0,
+          durationSeconds:
+            data.durationSeconds !== undefined
+              ? data.durationSeconds
+              : current?.durationSeconds ?? null,
+          snapshotLength:
+            data.snapshotLength !== undefined
+              ? data.snapshotLength
+              : current?.snapshotLength ?? null,
+          bufferSizeMb:
+            data.bufferSizeMb !== undefined
+              ? data.bufferSizeMb
+              : current?.bufferSizeMb ?? null,
+          promiscuous:
+            data.promiscuous !== undefined
+              ? Boolean(data.promiscuous)
+              : current?.promiscuous ?? true,
+          monitorMode:
+            data.monitorMode !== undefined
+              ? Boolean(data.monitorMode)
+              : current?.monitorMode ?? false,
+          captureFile:
+            data.captureFile !== undefined
+              ? data.captureFile
+              : current?.captureFile ?? null,
+          ringBuffer:
+            data.ringBuffer !== undefined
+              ? {
+                  enabled: Boolean(
+                    data.ringBuffer?.enabled
+                  ),
+                  fileSizeMb:
+                    data.ringBuffer?.fileSizeMb ??
+                    null,
+                  fileCount:
+                    data.ringBuffer?.fileCount ??
+                    null,
+                  durationSeconds:
+                    data.ringBuffer?.durationSeconds ??
+                    null,
+                }
+              : current?.ringBuffer ?? {
+                  enabled: false,
+                  fileSizeMb: null,
+                  fileCount: null,
+                  durationSeconds: null,
+                },
         }));
       } catch (err: any) {
         setError(
@@ -965,6 +1152,7 @@ export const TSharkDashboard: React.FC<
         loadInterfaces(),
         loadPackets(),
         loadStatistics(),
+        loadPcapFiles(),
       ]);
 
       setLoading(false);
@@ -974,6 +1162,7 @@ export const TSharkDashboard: React.FC<
       loadInterfaces,
       loadPackets,
       loadStatistics,
+      loadPcapFiles,
     ]
   );
 
@@ -1070,6 +1259,26 @@ export const TSharkDashboard: React.FC<
             count: packetLimit,
             captureFilter:
               captureFilter.trim(),
+            durationSeconds,
+            snapshotLength,
+            bufferSizeMb,
+            promiscuous,
+            monitorMode,
+            recordPcap,
+            ringBuffer: {
+              fileSizeMb:
+                recordPcap
+                  ? ringFileSizeMb
+                  : 0,
+              fileCount:
+                recordPcap
+                  ? ringFileCount
+                  : 0,
+              durationSeconds:
+                recordPcap
+                  ? ringDurationSeconds
+                  : 0,
+            },
           }),
         }
       );
@@ -1125,6 +1334,7 @@ export const TSharkDashboard: React.FC<
       await Promise.all([
         loadPackets(),
         loadStatistics(),
+        loadPcapFiles(),
       ]);
     } catch (err: any) {
       setError(
@@ -1346,6 +1556,281 @@ export const TSharkDashboard: React.FC<
               className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white outline-none focus:border-emerald-500 disabled:opacity-50"
               placeholder="Packet limit"
             />
+          </div>
+
+          <div className="rounded-xl border border-slate-800/80 bg-slate-950/40 p-4">
+            <button
+              type="button"
+              onClick={() =>
+                setAdvancedCaptureOpen(
+                  (current) => !current
+                )
+              }
+              className="flex w-full items-center justify-between text-left"
+            >
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wider text-cyan-300">
+                  Advanced Capture
+                </div>
+                <div className="mt-1 text-[11px] text-slate-500">
+                  Duration, packet sizing, capture mode and bounded PCAP recording.
+                </div>
+              </div>
+
+              <span className="text-[11px] font-semibold text-slate-400">
+                {advancedCaptureOpen ? "Hide" : "Show"}
+              </span>
+            </button>
+
+            {advancedCaptureOpen && (
+              <div className="mt-4 space-y-4">
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                  <label className="block">
+                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                      Duration (seconds)
+                    </span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={3600}
+                      value={durationSeconds}
+                      onChange={(event) =>
+                        setDurationSeconds(
+                          Math.min(
+                            Math.max(
+                              Number(event.target.value) || 0,
+                              0
+                            ),
+                            3600
+                          )
+                        )
+                      }
+                      className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-cyan-500/60"
+                    />
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                      Snapshot Length (bytes)
+                    </span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={65535}
+                      value={snapshotLength}
+                      onChange={(event) =>
+                        setSnapshotLength(
+                          Math.min(
+                            Math.max(
+                              Number(event.target.value) || 0,
+                              0
+                            ),
+                            65535
+                          )
+                        )
+                      }
+                      className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-cyan-500/60"
+                    />
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                      Capture Buffer (MB)
+                    </span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={64}
+                      value={bufferSizeMb}
+                      onChange={(event) =>
+                        setBufferSizeMb(
+                          Math.min(
+                            Math.max(
+                              Number(event.target.value) || 0,
+                              0
+                            ),
+                            64
+                          )
+                        )
+                      }
+                      className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-cyan-500/60"
+                    />
+                  </label>
+                </div>
+
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+                  <label className="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2">
+                    <input
+                      type="checkbox"
+                      checked={promiscuous}
+                      onChange={(event) =>
+                        setPromiscuous(
+                          event.target.checked
+                        )
+                      }
+                      className="h-4 w-4 accent-cyan-500"
+                    />
+                    <span>
+                      <span className="block text-xs font-medium text-slate-200">
+                        Promiscuous mode
+                      </span>
+                      <span className="block text-[10px] text-slate-500">
+                        Default ON
+                      </span>
+                    </span>
+                  </label>
+
+                  <label className="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2">
+                    <input
+                      type="checkbox"
+                      checked={monitorMode}
+                      onChange={(event) =>
+                        setMonitorMode(
+                          event.target.checked
+                        )
+                      }
+                      className="h-4 w-4 accent-cyan-500"
+                    />
+                    <span>
+                      <span className="block text-xs font-medium text-slate-200">
+                        Monitor mode
+                      </span>
+                      <span className="block text-[10px] text-amber-400/80">
+                        Driver/interface dependent
+                      </span>
+                    </span>
+                  </label>
+
+                  <label className="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2">
+                    <input
+                      type="checkbox"
+                      checked={recordPcap}
+                      onChange={(event) =>
+                        setRecordPcap(
+                          event.target.checked
+                        )
+                      }
+                      className="h-4 w-4 accent-emerald-500"
+                    />
+                    <span>
+                      <span className="block text-xs font-medium text-slate-200">
+                        Record PCAP
+                      </span>
+                      <span className="block text-[10px] text-emerald-400/80">
+                        OFF by default
+                      </span>
+                    </span>
+                  </label>
+                </div>
+
+                <div
+                  className={
+                    "rounded-lg border p-3 " +
+                    (recordPcap
+                      ? "border-emerald-500/20 bg-emerald-500/5"
+                      : "border-slate-800 bg-slate-950/30")
+                  }
+                >
+                  <div className="mb-3">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                      Ring Buffer
+                    </div>
+                    <div className="mt-1 text-[10px] text-slate-600">
+                      Bounded PCAP rotation. Available only when PCAP recording is enabled.
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                    <label className="block">
+                      <span className="mb-1 block text-[10px] text-slate-500">
+                        File size (MB)
+                      </span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        disabled={!recordPcap}
+                        value={ringFileSizeMb}
+                        onChange={(event) =>
+                          setRingFileSizeMb(
+                            Math.min(
+                              Math.max(
+                                Number(event.target.value) || 0,
+                                0
+                              ),
+                              100
+                            )
+                          )
+                        }
+                        className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none disabled:cursor-not-allowed disabled:opacity-40 focus:border-emerald-500/50"
+                      />
+                    </label>
+
+                    <label className="block">
+                      <span className="mb-1 block text-[10px] text-slate-500">
+                        File count
+                      </span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={20}
+                        disabled={!recordPcap}
+                        value={ringFileCount}
+                        onChange={(event) =>
+                          setRingFileCount(
+                            Math.min(
+                              Math.max(
+                                Number(event.target.value) || 0,
+                                0
+                              ),
+                              20
+                            )
+                          )
+                        }
+                        className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none disabled:cursor-not-allowed disabled:opacity-40 focus:border-emerald-500/50"
+                      />
+                    </label>
+
+                    <label className="block">
+                      <span className="mb-1 block text-[10px] text-slate-500">
+                        Rotation duration (seconds)
+                      </span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={3600}
+                        disabled={!recordPcap}
+                        value={ringDurationSeconds}
+                        onChange={(event) =>
+                          setRingDurationSeconds(
+                            Math.min(
+                              Math.max(
+                                Number(event.target.value) || 0,
+                                0
+                              ),
+                              3600
+                            )
+                          )
+                        }
+                        className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none disabled:cursor-not-allowed disabled:opacity-40 focus:border-emerald-500/50"
+                      />
+                    </label>
+                  </div>
+
+                  <div className="mt-3 text-[10px] text-slate-600">
+                    Keep at least one ring-buffer limit above zero when using rotation.
+                    Maximum configured footprint is bounded by the server.
+                  </div>
+                </div>
+
+                {monitorMode && (
+                  <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-[10px] leading-relaxed text-amber-300/80">
+                    Monitor mode depends on the selected interface and its driver.
+                    TShark may reject the capture if the interface does not support it.
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="lg:col-span-2">
@@ -2042,14 +2527,63 @@ export const TSharkDashboard: React.FC<
               PCAP / PCAPNG file
             </label>
 
-            <input
-              value={pcapFile}
-              onChange={(event) =>
-                setPcapFile(event.target.value)
-              }
-              placeholder="/tmp/cyberlab-tshark-test.pcapng"
-              className="w-full rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-white outline-none transition focus:border-cyan-500"
-            />
+            <div className="flex gap-2">
+              <select
+                value={pcapFile}
+                onChange={(event) =>
+                  setPcapFile(event.target.value)
+                }
+                disabled={
+                  pcapFilesLoading ||
+                  pcapFiles.length === 0
+                }
+                className="min-w-0 flex-1 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm text-white outline-none transition focus:border-cyan-500 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <option value="">
+                  {pcapFilesLoading
+                    ? "Loading managed captures..."
+                    : pcapFiles.length === 0
+                      ? "No managed PCAP files found"
+                      : "Select a PCAP / PCAPNG file"}
+                </option>
+
+                {pcapFiles.map((file) => (
+                  <option
+                    key={file.relativePath}
+                    value={file.relativePath}
+                  >
+                    {file.filename} —{" "}
+                    {formatBytes(file.sizeBytes)}
+                  </option>
+                ))}
+              </select>
+
+              <button
+                type="button"
+                onClick={loadPcapFiles}
+                disabled={pcapFilesLoading}
+                className="rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-xs font-semibold text-slate-200 transition hover:border-cyan-500 hover:text-cyan-300 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {pcapFilesLoading
+                  ? "Refreshing..."
+                  : "Refresh"}
+              </button>
+            </div>
+
+            {pcapFile && (
+              <div className="mt-2 text-xs text-slate-500">
+                Managed capture:{" "}
+                <span className="text-slate-400">
+                  {pcapFile}
+                </span>
+              </div>
+            )}
+
+            {pcapFilesError && (
+              <div className="mt-2 text-xs text-amber-400">
+                {pcapFilesError}
+              </div>
+            )}
           </div>
 
           <div className="flex items-end">

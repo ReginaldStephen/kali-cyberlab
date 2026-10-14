@@ -34,7 +34,7 @@ const securityTools: SecurityTool[] = [
     category: "Network Monitoring",
     description:
       "Network and infrastructure monitoring platform for observing devices, interfaces, traffic, performance metrics, and operational health.",
-    url: "http://127.0.0.1/observium",
+    url: "http://127.0.0.1:8081",
     status: "available",
     icon: <Activity className="h-6 w-6" />,
     accent: "blue",

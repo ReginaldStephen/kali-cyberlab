@@ -152,6 +152,11 @@ import {
   listBurpScope,
   addBurpScopeEntry,
   deleteBurpScopeEntry,
+  getBurpCapabilities,
+  listBurpTargets,
+  createBurpTarget,
+  updateBurpTarget,
+  deleteBurpTarget,
 } from "./src/server/burp";
 
 import {
@@ -167,6 +172,7 @@ import {
   TerminalExecutionResponse,
 } from "./src/types";
 
+import { observiumService } from "./src/server/observium";
 import {
   authenticate,
   createSession,
@@ -177,6 +183,10 @@ import {
   clearSessionCookie,
   auditLog,
 } from "./src/server/auth";
+
+import {
+  getToolRegistrySnapshot,
+} from "./src/server/toolRegistry";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -198,6 +208,35 @@ app.use((req, res, next) => {
     next
   ).catch(next);
 });
+
+// ============================================================
+// AUTHENTICATED TOOL REGISTRY API
+// ============================================================
+
+app.get(
+  "/api/tools/registry",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      return res.json(
+        await getToolRegistrySnapshot()
+      );
+    } catch (error: any) {
+      console.error(
+        "[Tool Registry] Snapshot retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        status: "error",
+        error:
+          error?.message ||
+          "Unable to retrieve tool registry.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
 
 // ============================================================
 // REPORT AI API
@@ -860,16 +899,6 @@ function startGreenboneAlertMonitor(): void {
 // OBSERVIUM DATABASE CLIENT
 // ============================================================
 
-const observiumDb = mysql.createPool({
-  host: process.env.OBSERVIUM_DB_HOST || "127.0.0.1",
-  port: Number(process.env.OBSERVIUM_DB_PORT) || 3306,
-  database: process.env.OBSERVIUM_DB_NAME || "observium",
-  user: process.env.OBSERVIUM_DB_USER || "observium",
-  password: process.env.OBSERVIUM_DB_PASSWORD || "",
-  waitForConnections: true,
-  connectionLimit: 5,
-  queueLimit: 0,
-});
 
 // ============================================================
 // GREENBONE GMP CLIENT
@@ -2112,118 +2141,59 @@ async function getCyberLabLiveContext() {
   // ------------------------------------------------------------
 
   try {
-    const [deviceRows] =
-      await observiumDb.query(`
-        SELECT
-          COUNT(*) AS total_devices,
-          SUM(
-            CASE
-              WHEN status = 1
-                AND disabled = 0
-              THEN 1
-              ELSE 0
-            END
-          ) AS online_devices,
-          SUM(
-            CASE
-              WHEN status = 0
-                OR disabled = 1
-              THEN 1
-              ELSE 0
-            END
-          ) AS offline_devices
-        FROM devices
-      `);
-
-    const [portRows] =
-      await observiumDb.query(`
-        SELECT
-          COUNT(*) AS total_interfaces,
-          SUM(
-            CASE
-              WHEN ifOperStatus = 'up'
-              THEN 1
-              ELSE 0
-            END
-          ) AS interfaces_up,
-          SUM(
-            CASE
-              WHEN ifOperStatus <> 'up'
-                OR ifOperStatus IS NULL
-              THEN 1
-              ELSE 0
-            END
-          ) AS interfaces_down,
-          SUM(
-            CASE
-              WHEN ifInErrors_rate > 0
-                OR ifOutErrors_rate > 0
-              THEN 1
-              ELSE 0
-            END
-          ) AS interfaces_with_errors,
-          SUM(
-            CASE
-              WHEN ifInOctets_perc >= 80
-                OR ifOutOctets_perc >= 80
-              THEN 1
-              ELSE 0
-            END
-          ) AS high_utilization_interfaces
-        FROM ports
-        WHERE deleted = 0
-          AND disabled = 0
-      `);
-
-    const [alertRows] =
-      await observiumDb.query(`
-        SELECT
-          COUNT(*) AS active_alerts
-        FROM alert_table
-        WHERE alert_status > 0
-      `);
-
-    const devices =
-      (deviceRows as any[])[0] || {};
-
-    const ports =
-      (portRows as any[])[0] || {};
-
-    const alerts =
-      (alertRows as any[])[0] || {};
+    const overview =
+      await observiumService.getOverview();
 
     context.observium.status = "online";
 
     context.observium.totalDevices =
-      Number(devices.total_devices || 0);
+      Number(
+        overview.devices?.total || 0
+      );
 
     context.observium.onlineDevices =
-      Number(devices.online_devices || 0);
+      Number(
+        overview.devices?.online || 0
+      );
 
     context.observium.offlineDevices =
-      Number(devices.offline_devices || 0);
+      Number(
+        overview.devices?.offline || 0
+      );
 
     context.observium.totalInterfaces =
-      Number(ports.total_interfaces || 0);
+      Number(
+        overview.interfaces?.total || 0
+      );
 
     context.observium.interfacesUp =
-      Number(ports.interfaces_up || 0);
+      Number(
+        overview.interfaces?.up || 0
+      );
 
     context.observium.interfacesDown =
-      Number(ports.interfaces_down || 0);
+      Number(
+        overview.interfaces?.down || 0
+      );
 
     context.observium.interfacesWithErrors =
-      Number(ports.interfaces_with_errors || 0);
+      Number(
+        overview.interfaces?.withErrors || 0
+      );
 
     context.observium.highUtilizationInterfaces =
       Number(
-        ports.high_utilization_interfaces || 0
+        overview.interfaces?.highUtilization || 0
       );
 
     context.observium.activeAlerts =
-      Number(alerts.active_alerts || 0);
+      Number(
+        overview.alerts?.active || 0
+      );
   } catch (error: any) {
-    context.observium.status = "offline";
+    context.observium.status =
+      "offline";
+
     context.observium.error =
       error?.message ||
       "Unable to retrieve Observium data.";
@@ -3409,187 +3379,43 @@ app.post(
 
 
 // ============================================================
-// OBSERVIUM DEVICES API
+// OBSERVIUM STAGE 1 API
 // ============================================================
 
 app.get(
-  "/api/integrations/observium/devices",
+  "/api/integrations/observium/status",
+  requirePermission("observium.view"),
   async (_req, res) => {
-  try {
-    const [rows] = await observiumDb.query(`
-      SELECT
-        device_id,
-        hostname,
-        sysName,
-        label,
-        ip,
-        os,
-        vendor,
-        hardware,
-        location,
-        status,
-        status_type,
-        disabled,
-        last_polled,
-        last_discovered
-      FROM devices
-      ORDER BY device_id ASC
-    `);
+    try {
+      return res.json(
+        await observiumService.getStatus()
+      );
+    } catch (err: any) {
+      console.error(
+        "Observium status failed:",
+        err
+      );
 
-    return res.json({
-      timestamp: new Date().toISOString(),
-      devices: rows,
-    });
-  } catch (err: any) {
-    console.error("Observium devices query failed:", err);
-
-    return res.status(500).json({
-      error:
-        err?.message ||
-        "Unable to retrieve devices from Observium.",
-    });
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium status.",
+      });
+    }
   }
-});
-
-// ============================================================
-// OBSERVIUM NETWORK OVERVIEW API
-// ============================================================
+);
 
 app.get(
   "/api/integrations/observium/overview",
+  requirePermission("observium.view"),
   async (_req, res) => {
     try {
-      const [deviceRows] = await observiumDb.query(`
-        SELECT
-          COUNT(*) AS total_devices,
-          SUM(
-            CASE
-              WHEN status = 1
-                AND disabled = 0
-              THEN 1
-              ELSE 0
-            END
-          ) AS online_devices,
-          SUM(
-            CASE
-              WHEN (status = 0 OR disabled = 1)
-              THEN 1
-              ELSE 0
-            END
-          ) AS offline_devices
-        FROM devices
-      `);
-
-      const [portRows] = await observiumDb.query(`
-        SELECT
-          COUNT(*) AS total_interfaces,
-          SUM(
-            CASE
-              WHEN ifOperStatus = 'up'
-              THEN 1
-              ELSE 0
-            END
-          ) AS interfaces_up,
-          SUM(
-            CASE
-              WHEN ifOperStatus <> 'up'
-                OR ifOperStatus IS NULL
-              THEN 1
-              ELSE 0
-            END
-          ) AS interfaces_down,
-          SUM(
-            CASE
-              WHEN ifInErrors_rate > 0
-                OR ifOutErrors_rate > 0
-              THEN 1
-              ELSE 0
-            END
-          ) AS interfaces_with_errors,
-          SUM(
-            CASE
-              WHEN ifInOctets_perc >= 80
-                OR ifOutOctets_perc >= 80
-              THEN 1
-              ELSE 0
-            END
-          ) AS high_utilization_interfaces
-        FROM ports
-        WHERE deleted = 0
-          AND disabled = 0
-      `);
-
-      const [alertRows] = await observiumDb.query(`
-        SELECT
-          COUNT(*) AS active_alerts
-        FROM alert_table
-        WHERE alert_status > 0
-      `);
-
-      const devices = (deviceRows as any[])[0] || {};
-      const ports = (portRows as any[])[0] || {};
-      const alerts = (alertRows as any[])[0] || {};
-
-      const totalDevices = Number(devices.total_devices || 0);
-      const onlineDevices = Number(devices.online_devices || 0);
-      const offlineDevices = Number(devices.offline_devices || 0);
-
-      const totalInterfaces = Number(ports.total_interfaces || 0);
-      const interfacesUp = Number(ports.interfaces_up || 0);
-      const interfacesDown = Number(ports.interfaces_down || 0);
-      const interfacesWithErrors = Number(
-        ports.interfaces_with_errors || 0
+      return res.json(
+        await observiumService.getOverview()
       );
-      const highUtilizationInterfaces = Number(
-        ports.high_utilization_interfaces || 0
-      );
-
-      const activeAlerts = Number(alerts.active_alerts || 0);
-
-      let health = "healthy";
-
-      if (
-        offlineDevices > 0 ||
-        activeAlerts > 0 ||
-        interfacesWithErrors > 0
-      ) {
-        health = "warning";
-      }
-
-      if (
-        offlineDevices > 0 &&
-        offlineDevices === totalDevices &&
-        totalDevices > 0
-      ) {
-        health = "critical";
-      }
-
-      return res.json({
-        timestamp: new Date().toISOString(),
-
-        health,
-
-        devices: {
-          total: totalDevices,
-          online: onlineDevices,
-          offline: offlineDevices,
-        },
-
-        interfaces: {
-          total: totalInterfaces,
-          up: interfacesUp,
-          down: interfacesDown,
-          withErrors: interfacesWithErrors,
-          highUtilization: highUtilizationInterfaces,
-        },
-
-        alerts: {
-          active: activeAlerts,
-        },
-      });
     } catch (err: any) {
       console.error(
-        "Observium network overview query failed:",
+        "Observium overview failed:",
         err
       );
 
@@ -3602,80 +3428,26 @@ app.get(
   }
 );
 
-
-
-// ============================================================
-// OBSERVIUM DEVICE SEARCH
-// ============================================================
-
 app.get(
   "/api/integrations/observium/devices/search",
+  requirePermission("observium.view"),
   async (req, res) => {
     try {
-      const rawQuery =
+      const query =
         typeof req.query.q === "string"
-          ? req.query.q.trim()
+          ? req.query.q
           : "";
 
-      if (!rawQuery) {
-        return res.json({
-          timestamp: new Date().toISOString(),
-          query: "",
-          devices: [],
-        });
-      }
-
-      const searchTerm = `%${rawQuery}%`;
-
-      const [rows] = await observiumDb.execute(
-        `
-        SELECT
-          device_id,
-          hostname,
-          sysName,
-          label,
-          ip,
-          os,
-          vendor,
-          hardware,
-          location,
-          status,
-          status_type,
-          disabled,
-          last_polled,
-          last_discovered
-        FROM devices
-        WHERE
-          hostname LIKE ?
-          OR sysName LIKE ?
-          OR label LIKE ?
-          OR ip LIKE ?
-          OR os LIKE ?
-          OR vendor LIKE ?
-          OR hardware LIKE ?
-          OR location LIKE ?
-        ORDER BY device_id ASC
-        LIMIT 50
-        `,
-        [
-          searchTerm,
-          searchTerm,
-          searchTerm,
-          searchTerm,
-          searchTerm,
-          searchTerm,
-          searchTerm,
-          searchTerm,
-        ]
+      return res.json(
+        await observiumService.searchDevices(
+          query
+        )
       );
-
-      return res.json({
-        timestamp: new Date().toISOString(),
-        query: rawQuery,
-        devices: rows,
-      });
     } catch (err: any) {
-      console.error("Observium device search failed:", err);
+      console.error(
+        "Observium device search failed:",
+        err
+      );
 
       return res.status(500).json({
         error:
@@ -3686,148 +3458,483 @@ app.get(
   }
 );
 
-// ============================================================
-// OBSERVIUM DEVICE DETAILS
-// ============================================================
+app.get(
+  "/api/integrations/observium/devices",
+  requirePermission("observium.view"),
+  async (_req, res) => {
+    try {
+      return res.json(
+        await observiumService.getDevices()
+      );
+    } catch (err: any) {
+      console.error(
+        "Observium devices query failed:",
+        err
+      );
+
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Unable to retrieve devices from Observium.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/observium/devices/test",
+  requirePermission("observium.devices.manage"),
+  async (req, res) => {
+    try {
+      const result =
+        await observiumService.testDevice(
+          req.body || {},
+        );
+
+      return res.json({
+        ok: result.ok,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      });
+    } catch (err: any) {
+      console.error(
+        "Observium SNMP test failed:",
+        err,
+      );
+
+      return res.status(400).json({
+        ok: false,
+        error:
+          err?.message ||
+          "Unable to test Observium SNMP credentials.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/integrations/observium/devices",
+  requirePermission("observium.devices.manage"),
+  async (req, res) => {
+    try {
+      const result =
+        await observiumService.addManagedDevice(
+          req.body || {},
+        );
+
+      if (!result.device) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            result.stderr ||
+            result.stdout ||
+            "Observium did not add the device.",
+          stdout: result.stdout,
+          stderr: result.stderr,
+        });
+      }
+
+      return res.status(201).json({
+        ok: true,
+        device: result.device,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      });
+    } catch (err: any) {
+      console.error(
+        "Observium device add failed:",
+        err,
+      );
+
+      return res.status(400).json({
+        ok: false,
+        error:
+          err?.message ||
+          "Unable to add the Observium device.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/integrations/observium/devices/:deviceId/discover",
+  requirePermission("observium.devices.manage"),
+  async (req, res) => {
+    try {
+      const result =
+        await observiumService.discoverManagedDevice(
+          req.params.deviceId,
+        );
+
+      return res.json({
+        ok: result.ok,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        device: result.device,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      });
+    } catch (err: any) {
+      console.error(
+        "Observium device discovery failed:",
+        err,
+      );
+
+      return res.status(400).json({
+        ok: false,
+        error:
+          err?.message ||
+          "Unable to discover the Observium device.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/integrations/observium/devices/:deviceId/poll",
+  requirePermission("observium.devices.manage"),
+  async (req, res) => {
+    try {
+      const result =
+        await observiumService.pollManagedDevice(
+          req.params.deviceId,
+        );
+
+      return res.json({
+        ok: result.ok,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        device: result.device,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      });
+    } catch (err: any) {
+      console.error(
+        "Observium device poll failed:",
+        err,
+      );
+
+      return res.status(400).json({
+        ok: false,
+        error:
+          err?.message ||
+          "Unable to poll the Observium device.",
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/ports",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        ports:
+          await observiumService.getPorts(
+            req.params.deviceId
+          ),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium ports.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/processors",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        processors:
+          await observiumService.getProcessors(
+            req.params.deviceId
+          ),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium processors.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/memory",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        memory:
+          await observiumService.getMemory(
+            req.params.deviceId
+          ),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium memory pools.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/storage",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        storage:
+          await observiumService.getStorage(
+            req.params.deviceId
+          ),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium storage.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/sensors",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        sensors:
+          await observiumService.getSensors(
+            req.params.deviceId
+          ),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium sensors.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/addresses",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        ...(await observiumService.getAddresses(
+          req.params.deviceId
+        )),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium addresses.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/vlans",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        ...(await observiumService.getVlans(
+          req.params.deviceId
+        )),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium VLAN data.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/neighbours",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        neighbours:
+          await observiumService.getNeighbours(
+            req.params.deviceId
+          ),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium neighbours.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/inventory",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        ...(await observiumService.getInventory(
+          req.params.deviceId
+        )),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium inventory.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/counters",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        counters:
+          await observiumService.getCounters(
+            req.params.deviceId
+          ),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium counters.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/devices/:deviceId/probes",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        deviceId:
+          Number(req.params.deviceId),
+        ...(await observiumService.getProbes(
+          req.params.deviceId
+        )),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium probes.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/topology",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json(
+        await observiumService.getTopology()
+      );
+    } catch (err: any) {
+      return res.status(400).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium topology.",
+      });
+    }
+  }
+);
 
 app.get(
   "/api/integrations/observium/devices/:deviceId",
+  requirePermission("observium.view"),
   async (req, res) => {
     try {
-      const deviceId = Number(req.params.deviceId);
+      const details =
+        await observiumService.getDeviceDetails(
+          req.params.deviceId
+        );
 
-      if (!Number.isInteger(deviceId) || deviceId <= 0) {
-        return res.status(400).json({
-          error: "Invalid Observium device ID.",
-        });
-      }
-
-      const [deviceRows] = await observiumDb.execute(
-        `
-        SELECT
-          device_id,
-          hostname,
-          sysName,
-          label,
-          ip,
-          os,
-          vendor,
-          hardware,
-          location,
-          status,
-          status_type,
-          disabled,
-          last_polled,
-          last_discovered
-        FROM devices
-        WHERE device_id = ?
-        LIMIT 1
-        `,
-        [deviceId]
-      );
-
-      const devices = deviceRows as any[];
-
-      if (devices.length === 0) {
+      if (!details) {
         return res.status(404).json({
-          error: "Observium device not found.",
+          error:
+            "Observium device not found.",
         });
       }
 
-      const device = devices[0];
-
-      const [portRows] = await observiumDb.execute(
-        `
-        SELECT
-          port_id,
-          device_id,
-          port_label,
-          ifDescr,
-          ifName,
-          ifIndex,
-          ifSpeed,
-          ifHighSpeed,
-          ifOperStatus,
-          ifAdminStatus,
-          ifDuplex,
-          ifMtu,
-          ifType,
-          ifAlias,
-          ifPhysAddress,
-          ifInOctets,
-          ifOutOctets,
-          ifInErrors,
-          ifOutErrors,
-        poll_time,
-        poll_period
-        FROM ports
-        WHERE device_id = ?
-          AND deleted = 0
-        ORDER BY ifIndex ASC
-        `,
-        [deviceId]
-      );
-
-      const [processorRows] = await observiumDb.execute(
-        `
-        SELECT *
-        FROM processors
-        WHERE device_id = ?
-        ORDER BY processor_id ASC
-        `,
-        [deviceId]
-      );
-
-      const [memoryRows] = await observiumDb.execute(
-        `
-        SELECT *
-        FROM mempools
-        WHERE device_id = ?
-        ORDER BY mempool_id ASC
-        `,
-        [deviceId]
-      );
-
-      const [storageRows] = await observiumDb.execute(
-        `
-        SELECT *
-        FROM storage
-        WHERE device_id = ?
-        ORDER BY storage_id ASC
-        `,
-        [deviceId]
-      );
-
-      const [sensorRows] = await observiumDb.execute(
-        `
-        SELECT *
-        FROM sensors
-        WHERE device_id = ?
-          AND sensor_deleted = 0
-        ORDER BY sensor_id ASC
-        `,
-        [deviceId]
-      );
-
-      return res.json({
-        timestamp: new Date().toISOString(),
-
-        device,
-
-        ports: portRows,
-
-        processors: processorRows,
-
-        memory: memoryRows,
-
-        storage: storageRows,
-
-        sensors: sensorRows,
-      });
+      return res.json(details);
     } catch (err: any) {
-      console.error("Observium device details query failed:", err);
-
-      return res.status(500).json({
+      return res.status(400).json({
         error:
           err?.message ||
           "Unable to retrieve Observium device details.",
@@ -3836,8 +3943,118 @@ app.get(
   }
 );
 
+app.get(
+  "/api/integrations/observium/alerts",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        alerts:
+          await observiumService.getAlerts(
+            req.query.limit
+          ),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium alerts.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/alerts/log",
+  requirePermission("observium.view"),
+  async (req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        log:
+          await observiumService.getAlertLog(
+            req.query.limit
+          ),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium alert log.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/alerts/checks",
+  requirePermission("observium.view"),
+  async (_req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        ...(await observiumService.getAlertChecks()),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium alert checks.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/groups",
+  requirePermission("observium.view"),
+  async (_req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        ...(await observiumService.getGroups()),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium groups.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/observium/maintenance",
+  requirePermission("observium.view"),
+  async (_req, res) => {
+    try {
+      return res.json({
+        timestamp:
+          new Date().toISOString(),
+        ...(await observiumService.getMaintenance()),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        error:
+          err?.message ||
+          "Unable to retrieve Observium maintenance.",
+      });
+    }
+  }
+);
+
+
+
 // ============================================================
 // 1. SYSTEM HEALTH
+// ============================================================
+
 // ============================================================
 
 app.get("/api/system/health", async (_req, res) => {
@@ -8300,6 +8517,223 @@ app.get(
   }
 );
 
+app.get(
+  "/api/integrations/burp/capabilities",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      const status = await getBurpStatus();
+
+      return res.json({
+        success: true,
+        capabilities: getBurpCapabilities(
+          status.edition
+        ),
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Capability retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Unable to retrieve Burp capabilities.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/burp/targets",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      return res.json({
+        success: true,
+        targets: listBurpTargets(),
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Target retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Unable to retrieve Burp targets.",
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/integrations/burp/targets",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+
+      if (
+        typeof body.baseUrl !== "string" ||
+        !body.baseUrl.trim()
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "A Burp target base URL is required.",
+        });
+      }
+
+      const target = createBurpTarget({
+        name:
+          typeof body.name === "string"
+            ? body.name
+            : undefined,
+        baseUrl: body.baseUrl.trim(),
+        notes:
+          typeof body.notes === "string"
+            ? body.notes
+            : undefined,
+      });
+
+      return res.status(201).json({
+        success: true,
+        target,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Target creation failed:",
+        error
+      );
+
+      return res.status(400).json({
+        success: false,
+        error:
+          error?.message ||
+          "Unable to create Burp target.",
+      });
+    }
+  }
+);
+
+app.put(
+  "/api/integrations/burp/targets/:id",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const id =
+        typeof req.params.id === "string"
+          ? req.params.id.trim()
+          : "";
+
+      if (!id) {
+        return res.status(400).json({
+          success: false,
+          error: "A Burp target ID is required.",
+        });
+      }
+
+      const body = req.body || {};
+
+      const target = updateBurpTarget(id, {
+        name:
+          typeof body.name === "string"
+            ? body.name
+            : undefined,
+        baseUrl:
+          typeof body.baseUrl === "string"
+            ? body.baseUrl
+            : undefined,
+        inScope:
+          typeof body.inScope === "boolean"
+            ? body.inScope
+            : undefined,
+        enabled:
+          typeof body.enabled === "boolean"
+            ? body.enabled
+            : undefined,
+        notes:
+          typeof body.notes === "string"
+            ? body.notes
+            : undefined,
+      });
+
+      if (!target) {
+        return res.status(404).json({
+          success: false,
+          error: "Burp target not found.",
+        });
+      }
+
+      return res.json({
+        success: true,
+        target,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Target update failed:",
+        error
+      );
+
+      return res.status(400).json({
+        success: false,
+        error:
+          error?.message ||
+          "Unable to update Burp target.",
+      });
+    }
+  }
+);
+
+app.delete(
+  "/api/integrations/burp/targets/:id",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const id =
+        typeof req.params.id === "string"
+          ? req.params.id.trim()
+          : "";
+
+      if (!id) {
+        return res.status(400).json({
+          success: false,
+          error: "A Burp target ID is required.",
+        });
+      }
+
+      const deleted = deleteBurpTarget(id);
+
+      if (!deleted) {
+        return res.status(404).json({
+          success: false,
+          error: "Burp target not found.",
+        });
+      }
+
+      return res.json({
+        success: true,
+      });
+    } catch (error: any) {
+      console.error(
+        "[Burp] Target deletion failed:",
+        error
+      );
+
+      return res.status(400).json({
+        success: false,
+        error:
+          error?.message ||
+          "Unable to delete Burp target.",
+      });
+    }
+  }
+);
+
 app.post(
   "/api/integrations/burp/bridge/traffic",
   async (req, res) => {
@@ -9221,6 +9655,167 @@ app.get(
         error:
           error?.message ||
           "Unable to retrieve Burp findings.",
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/httpx/status",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      const installation =
+        await getHttpxInstallation();
+
+      let version: string | null = null;
+      let versionError: string | null = null;
+
+      if (installation.installed) {
+        try {
+          version =
+            await getHttpxVersion();
+        } catch (error: any) {
+          versionError =
+            error?.message ||
+            "Unable to determine HTTPX version.";
+        }
+      }
+
+      return res.json({
+        status:
+          installation.installed
+            ? "online"
+            : "offline",
+        installed:
+          installation.installed,
+        binary:
+          installation.binary,
+        version,
+        ...(versionError
+          ? { versionError }
+          : {}),
+        message:
+          installation.installed
+            ? "HTTPX is installed and available."
+            : "HTTPX binary was not found.",
+        timestamp:
+          new Date().toISOString(),
+      });
+    } catch (error: any) {
+      console.error(
+        "[HTTPX] Status check failed:",
+        error
+      );
+
+      return res.status(500).json({
+        status: "error",
+        installed: false,
+        error:
+          error?.message ||
+          "Unable to determine HTTPX status.",
+        timestamp:
+          new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/httpx/capabilities",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      const capabilities =
+        await getHttpxCapabilities();
+
+      return res.json({
+        success: true,
+        status: "online",
+        capabilities,
+        timestamp:
+          new Date().toISOString(),
+      });
+    } catch (error: any) {
+      console.error(
+        "[HTTPX] Capability check failed:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Unable to determine HTTPX capabilities.",
+        timestamp:
+          new Date().toISOString(),
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/integrations/httpx/results",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const rawLimit =
+        Number(req.query.limit);
+
+      const limit =
+        Number.isFinite(rawLimit) &&
+        rawLimit > 0
+          ? Math.floor(rawLimit)
+          : 100;
+
+      const results =
+        listHttpxResults(limit);
+
+      return res.json({
+        success: true,
+        results,
+        count: results.length,
+      });
+    } catch (error: any) {
+      console.error(
+        "[HTTPX] Results retrieval failed:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Unable to retrieve HTTPX results.",
+      });
+    }
+  }
+);
+
+app.delete(
+  "/api/integrations/httpx/results",
+  requireAuthentication,
+  requirePermission("web_auditor.run"),
+  async (_req, res) => {
+    try {
+      clearHttpxResults();
+
+      return res.json({
+        success: true,
+        results: [],
+        count: 0,
+      });
+    } catch (error: any) {
+      console.error(
+        "[HTTPX] Results clear failed:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error?.message ||
+          "Unable to clear HTTPX results.",
       });
     }
   }
@@ -10300,6 +10895,239 @@ app.get(
 );
 
 app.get(
+  "/api/integrations/tshark/pcap/files",
+  requireAuthentication,
+  async (_req, res) => {
+    try {
+      const captureDirectory = path.resolve(
+        process.cwd(),
+        "data",
+        "tshark-captures",
+      );
+
+      await fs.promises.mkdir(captureDirectory, {
+        recursive: true,
+      });
+
+      const entries = await fs.promises.readdir(
+        captureDirectory,
+        { withFileTypes: true },
+      );
+
+      const allowedExtensions = new Set([
+        ".pcap",
+        ".pcapng",
+      ]);
+
+      const files = [];
+
+      for (const entry of entries) {
+        if (!entry.isFile()) {
+          continue;
+        }
+
+        const extension = path.extname(entry.name).toLowerCase();
+
+        if (!allowedExtensions.has(extension)) {
+          continue;
+        }
+
+        const absolutePath = path.resolve(
+          captureDirectory,
+          entry.name,
+        );
+
+        const stats = await fs.promises.stat(absolutePath);
+
+        if (!stats.isFile()) {
+          continue;
+        }
+
+        files.push({
+          filename: entry.name,
+          relativePath: path
+            .relative(process.cwd(), absolutePath)
+            .split(path.sep)
+            .join("/"),
+          sizeBytes: stats.size,
+          modifiedAt: stats.mtime.toISOString(),
+          extension,
+        });
+      }
+
+      files.sort(
+        (a, b) =>
+          new Date(b.modifiedAt).getTime() -
+          new Date(a.modifiedAt).getTime(),
+      );
+
+      const totalBytes = files.reduce(
+        (total, file) => total + file.sizeBytes,
+        0,
+      );
+
+      const maxFiles = 50;
+      const maxBytes = 1024 * 1024 * 1024;
+      const storagePercent =
+        maxBytes > 0
+          ? Math.min(
+              100,
+              Number(
+                ((totalBytes / maxBytes) * 100).toFixed(2),
+              ),
+            )
+          : 0;
+
+      const boundedFiles = files.slice(0, 100);
+
+      res.json({
+        status: "online",
+        directory: "data/tshark-captures",
+        totalFiles: files.length,
+        returnedFiles: boundedFiles.length,
+        totalBytes,
+        maxFiles,
+        maxBytes,
+        storagePercent,
+        files: boundedFiles,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error(
+        "[TShark PCAP] Failed to enumerate capture files:",
+        error,
+      );
+
+      res.status(500).json({
+        error: "Unable to enumerate TShark capture files.",
+      });
+    }
+  },
+);
+
+app.delete(
+  "/api/integrations/tshark/pcap/files",
+  requireAuthentication,
+  async (req, res) => {
+    try {
+      const requestedFile =
+        typeof req.body?.file === "string"
+          ? req.body.file.trim()
+          : "";
+
+      if (!requestedFile) {
+        return res.status(400).json({
+          error: "A capture file path is required.",
+        });
+      }
+
+      const captureDirectory = path.resolve(
+        process.cwd(),
+        "data",
+        "tshark-captures",
+      );
+
+      const requestedAbsolutePath = path.resolve(
+        process.cwd(),
+        requestedFile,
+      );
+
+      const relativeToCaptureDirectory =
+        path.relative(
+          captureDirectory,
+          requestedAbsolutePath,
+        );
+
+      const isInsideCaptureDirectory =
+        relativeToCaptureDirectory === "" ||
+        (
+          !relativeToCaptureDirectory.startsWith("..") &&
+          !path.isAbsolute(relativeToCaptureDirectory)
+        );
+
+      if (!isInsideCaptureDirectory) {
+        return res.status(400).json({
+          error:
+            "Only managed TShark capture files can be deleted.",
+        });
+      }
+
+      const extension =
+        path.extname(requestedAbsolutePath).toLowerCase();
+
+      if (
+        extension !== ".pcap" &&
+        extension !== ".pcapng"
+      ) {
+        return res.status(400).json({
+          error:
+            "Only .pcap and .pcapng files can be deleted.",
+        });
+      }
+
+      const tsharkCaptureState =
+        getTSharkCaptureState();
+
+      if (tsharkCaptureState.running) {
+        return res.status(409).json({
+          error:
+            "TShark capture is active. Capture files cannot be deleted until the capture stops.",
+        });
+      }
+
+      const stats =
+        await fs.promises.stat(
+          requestedAbsolutePath,
+        );
+
+      if (!stats.isFile()) {
+        return res.status(400).json({
+          error:
+            "The requested capture path is not a file.",
+        });
+      }
+
+      await fs.promises.unlink(
+        requestedAbsolutePath,
+      );
+
+      return res.json({
+        status: "deleted",
+        filename: path.basename(
+          requestedAbsolutePath,
+        ),
+        relativePath: path
+          .relative(
+            process.cwd(),
+            requestedAbsolutePath,
+          )
+          .split(path.sep)
+          .join("/"),
+        sizeBytes: stats.size,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error: any) {
+      if (error?.code === "ENOENT") {
+        return res.status(404).json({
+          error: "Capture file not found.",
+        });
+      }
+
+      console.error(
+        "[TShark PCAP] Failed to delete capture file:",
+        error,
+      );
+
+      return res.status(500).json({
+        error:
+          error?.message ||
+          "Unable to delete TShark capture file.",
+      });
+    }
+  },
+);
+
+app.get(
   "/api/integrations/tshark/pcap/packet",
   async (req, res) => {
     try {
@@ -10643,6 +11471,13 @@ app.post(
         interface: interfaceName,
         count,
         captureFilter,
+        durationSeconds,
+        snapshotLength,
+        bufferSizeMb,
+        promiscuous,
+        monitorMode,
+        recordPcap,
+        ringBuffer,
       } = req.body || {};
 
       const selectedInterface =
@@ -10651,13 +11486,18 @@ app.post(
           ? interfaceName.trim()
           : "any";
 
-      const packetCount = Math.min(
-        Math.max(
-          Number(count) || 100,
-          1
-        ),
-        5000
-      );
+      const packetCount =
+        count === undefined ||
+        count === null ||
+        Number.isNaN(Number(count))
+          ? undefined
+          : Math.min(
+              Math.max(
+                Math.trunc(Number(count)),
+                1
+              ),
+              5000
+            );
 
       const selectedCaptureFilter =
         typeof captureFilter === "string"
@@ -10680,12 +11520,119 @@ app.post(
         });
       }
 
+      const normalizedDurationSeconds =
+        Number.isFinite(Number(durationSeconds))
+          ? Math.min(
+              Math.max(
+                Number(durationSeconds),
+                0
+              ),
+              3600
+            )
+          : 0;
+
+      const normalizedSnapshotLength =
+        Number.isFinite(Number(snapshotLength))
+          ? Math.min(
+              Math.max(
+                Number(snapshotLength),
+                0
+              ),
+              65535
+            )
+          : 0;
+
+      const normalizedBufferSizeMb =
+        Number.isFinite(Number(bufferSizeMb))
+          ? Math.min(
+              Math.max(
+                Number(bufferSizeMb),
+                0
+              ),
+              64
+            )
+          : 0;
+
+      const normalizedPromiscuous =
+        promiscuous !== false;
+
+      const normalizedMonitorMode =
+        monitorMode === true;
+
+      const normalizedRecordPcap =
+        recordPcap === true;
+
+      const normalizedRingBuffer =
+        ringBuffer &&
+        typeof ringBuffer === "object"
+          ? {
+              fileSizeMb:
+                Number.isFinite(
+                  Number(ringBuffer.fileSizeMb)
+                )
+                  ? Math.min(
+                      Math.max(
+                        Number(
+                          ringBuffer.fileSizeMb
+                        ),
+                        0
+                      ),
+                      100
+                    )
+                  : 0,
+              fileCount:
+                Number.isFinite(
+                  Number(ringBuffer.fileCount)
+                )
+                  ? Math.min(
+                      Math.max(
+                        Number(
+                          ringBuffer.fileCount
+                        ),
+                        0
+                      ),
+                      20
+                    )
+                  : 0,
+              durationSeconds:
+                Number.isFinite(
+                  Number(
+                    ringBuffer.durationSeconds
+                  )
+                )
+                  ? Math.min(
+                      Math.max(
+                        Number(
+                          ringBuffer.durationSeconds
+                        ),
+                        0
+                      ),
+                      3600
+                    )
+                  : 0,
+            }
+          : undefined;
+
       const capture =
         startTSharkCapture({
           interface: selectedInterface,
           count: packetCount,
           captureFilter:
             selectedCaptureFilter,
+          durationSeconds:
+            normalizedDurationSeconds,
+          snapshotLength:
+            normalizedSnapshotLength,
+          bufferSizeMb:
+            normalizedBufferSizeMb,
+          promiscuous:
+            normalizedPromiscuous,
+          monitorMode:
+            normalizedMonitorMode,
+          recordPcap:
+            normalizedRecordPcap,
+          ringBuffer:
+            normalizedRingBuffer,
           emitEvent: recordCyberLabEvent,
         });
 
@@ -10702,6 +11649,22 @@ app.post(
           count: packetCount,
           captureFilter:
             selectedCaptureFilter || null,
+          durationSeconds:
+            normalizedDurationSeconds || null,
+          snapshotLength:
+            normalizedSnapshotLength || null,
+          bufferSizeMb:
+            normalizedBufferSizeMb || null,
+          promiscuous:
+            normalizedPromiscuous,
+          monitorMode:
+            normalizedMonitorMode,
+          recordPcap:
+            normalizedRecordPcap,
+          ringBuffer:
+            normalizedRingBuffer || null,
+          captureFile:
+            capture.captureFile || null,
           pid: capture.pid,
         },
       });

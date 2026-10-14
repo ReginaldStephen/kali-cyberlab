@@ -1,5 +1,7 @@
 import { spawn, execFile } from "child_process";
 import { promisify } from "util";
+import fs from "fs";
+import path from "path";
 import {
   processTSharkPacket,
   type TSharkEventEmitter,
@@ -92,11 +94,57 @@ interface CaptureState {
   packets: TSharkPacket[];
   pid: number | null;
   error: string | null;
+
+  durationSeconds: number | null;
+  snapshotLength: number | null;
+  bufferSizeMb: number | null;
+  promiscuous: boolean;
+  monitorMode: boolean;
+
+  captureFile: string | null;
+  ringBuffer: {
+    enabled: boolean;
+    fileSizeMb: number | null;
+    fileCount: number | null;
+    durationSeconds: number | null;
+  };
 }
 
 const MAX_PACKET_HISTORY = 5000;
 
+const TSHARK_CAPTURE_DIR = path.resolve(
+  process.cwd(),
+  "data",
+  "tshark-captures"
+);
+
+const MAX_CAPTURE_DURATION_SECONDS = 3600;
+const MAX_SNAPSHOT_LENGTH = 65535;
+const MAX_BUFFER_SIZE_MB = 64;
+const MAX_RING_FILE_SIZE_MB = 100;
+const MAX_RING_FILE_COUNT = 20;
+
 let captureProcess: ReturnType<typeof spawn> | null = null;
+
+function ensureTSharkCaptureDirectory(): void {
+  fs.mkdirSync(TSHARK_CAPTURE_DIR, {
+    recursive: true,
+  });
+}
+
+function createTSharkCapturePath(): string {
+  ensureTSharkCaptureDirectory();
+
+  const timestamp =
+    new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-");
+
+  return path.join(
+    TSHARK_CAPTURE_DIR,
+    `capture-${timestamp}.pcapng`
+  );
+}
 
 const captureState: CaptureState = {
   running: false,
@@ -109,6 +157,20 @@ const captureState: CaptureState = {
   packets: [],
   pid: null,
   error: null,
+
+  durationSeconds: null,
+  snapshotLength: null,
+  bufferSizeMb: null,
+  promiscuous: true,
+  monitorMode: false,
+
+  captureFile: null,
+  ringBuffer: {
+    enabled: false,
+    fileSizeMb: null,
+    fileCount: null,
+    durationSeconds: null,
+  },
 };
 
 function parsePacket(line: string): TSharkPacket | null {
@@ -1047,8 +1109,11 @@ export async function extractTSharkFields(
 }
 
 export async function getTSharkVersion(): Promise<string> {
+  const tsharkBinary =
+    process.env.TSHARK_BINARY || "/usr/bin/tshark";
+
   const { stdout } = await execFileAsync(
-    "tshark",
+    tsharkBinary,
     ["--version"],
     {
       timeout: 5000,
@@ -1064,8 +1129,11 @@ export async function getTSharkVersion(): Promise<string> {
 }
 
 export async function getTSharkInterfaces(): Promise<TSharkInterface[]> {
+  const tsharkBinary =
+    process.env.TSHARK_BINARY || "/usr/bin/tshark";
+
   const { stdout } = await execFileAsync(
-    "tshark",
+    tsharkBinary,
     ["-D"],
     {
       timeout: 5000,
@@ -1094,7 +1162,7 @@ export async function getTSharkInterfaces(): Promise<TSharkInterface[]> {
     );
 }
 
-export function getTSharkCaptureState() {
+export function getTSharkCaptureState(): CaptureState {
   return {
     running: captureState.running,
     interface: captureState.interface,
@@ -1106,6 +1174,19 @@ export function getTSharkCaptureState() {
     packets: captureState.packets,
     pid: captureState.pid,
     error: captureState.error,
+    durationSeconds: captureState.durationSeconds,
+    snapshotLength: captureState.snapshotLength,
+    bufferSizeMb: captureState.bufferSizeMb,
+    promiscuous: captureState.promiscuous,
+    monitorMode: captureState.monitorMode,
+    captureFile: captureState.captureFile,
+    ringBuffer: {
+      enabled: captureState.ringBuffer.enabled,
+      fileSizeMb: captureState.ringBuffer.fileSizeMb,
+      fileCount: captureState.ringBuffer.fileCount,
+      durationSeconds:
+        captureState.ringBuffer.durationSeconds,
+    },
   };
 }
 
@@ -1231,6 +1312,19 @@ export function clearTSharkCapture() {
   captureState.stoppedAt = null;
   captureState.error = null;
 
+  captureState.durationSeconds = null;
+  captureState.snapshotLength = null;
+  captureState.bufferSizeMb = null;
+  captureState.promiscuous = true;
+  captureState.monitorMode = false;
+  captureState.captureFile = null;
+  captureState.ringBuffer = {
+    enabled: false,
+    fileSizeMb: null,
+    fileCount: null,
+    durationSeconds: null,
+  };
+
   return getTSharkCaptureState();
 }
 
@@ -1238,8 +1332,19 @@ export function startTSharkCapture(options?: {
   interface?: string;
   count?: number;
   captureFilter?: string;
+  durationSeconds?: number;
+  snapshotLength?: number;
+  bufferSizeMb?: number;
+  promiscuous?: boolean;
+  monitorMode?: boolean;
+  recordPcap?: boolean;
+  ringBuffer?: {
+    fileSizeMb?: number;
+    fileCount?: number;
+    durationSeconds?: number;
+  };
   emitEvent?: TSharkEventEmitter;
-}) {
+}): CaptureState {
   if (captureState.running) {
     throw new Error("A TShark capture is already running.");
   }
@@ -1247,16 +1352,96 @@ export function startTSharkCapture(options?: {
   const interfaceName =
     options?.interface?.trim() || "any";
 
-  const count = Math.min(
-    Math.max(
-      Number(options?.count) || 100,
-      1
-    ),
-    5000
-  );
+  const requestedCount =
+    options?.count === undefined ||
+    options?.count === null ||
+    Number.isNaN(Number(options?.count))
+      ? null
+      : Number(options.count);
+
+  const count =
+    requestedCount === null
+      ? null
+      : Math.min(
+          Math.max(
+            Math.trunc(requestedCount),
+            1
+          ),
+          5000
+        );
 
   const captureFilter =
     options?.captureFilter?.trim() || "";
+
+  const durationSeconds = Math.min(
+    Math.max(
+      Number(options?.durationSeconds) || 0,
+      0
+    ),
+    MAX_CAPTURE_DURATION_SECONDS
+  );
+
+  const snapshotLength = Math.min(
+    Math.max(
+      Number(options?.snapshotLength) || 0,
+      0
+    ),
+    MAX_SNAPSHOT_LENGTH
+  );
+
+  const bufferSizeMb = Math.min(
+    Math.max(
+      Number(options?.bufferSizeMb) || 0,
+      0
+    ),
+    MAX_BUFFER_SIZE_MB
+  );
+
+  const promiscuous =
+    options?.promiscuous !== false;
+
+  const monitorMode =
+    options?.monitorMode === true;
+
+  const recordPcap =
+    options?.recordPcap === true;
+
+  const ringFileSizeMb = Math.min(
+    Math.max(
+      Number(options?.ringBuffer?.fileSizeMb) || 0,
+      0
+    ),
+    MAX_RING_FILE_SIZE_MB
+  );
+
+  const ringFileCount = Math.min(
+    Math.max(
+      Number(options?.ringBuffer?.fileCount) || 0,
+      0
+    ),
+    MAX_RING_FILE_COUNT
+  );
+
+  const ringDurationSeconds = Math.min(
+    Math.max(
+      Number(options?.ringBuffer?.durationSeconds) || 0,
+      0
+    ),
+    MAX_CAPTURE_DURATION_SECONDS
+  );
+
+  const ringEnabled =
+    recordPcap &&
+    (
+      ringFileSizeMb > 0 ||
+      ringFileCount > 0 ||
+      ringDurationSeconds > 0
+    );
+
+  const captureFile =
+    recordPcap
+      ? createTSharkCapturePath()
+      : null;
 
   captureState.running = true;
   captureState.interface = interfaceName;
@@ -1269,11 +1454,44 @@ export function startTSharkCapture(options?: {
   captureState.pid = null;
   captureState.error = null;
 
+  captureState.durationSeconds =
+    durationSeconds > 0
+      ? durationSeconds
+      : null;
+
+  captureState.snapshotLength =
+    snapshotLength > 0
+      ? snapshotLength
+      : null;
+
+  captureState.bufferSizeMb =
+    bufferSizeMb > 0
+      ? bufferSizeMb
+      : null;
+
+  captureState.promiscuous = promiscuous;
+  captureState.monitorMode = monitorMode;
+  captureState.captureFile = captureFile;
+
+  captureState.ringBuffer = {
+    enabled: ringEnabled,
+    fileSizeMb:
+      ringFileSizeMb > 0
+        ? ringFileSizeMb
+        : null,
+    fileCount:
+      ringFileCount > 0
+        ? ringFileCount
+        : null,
+    durationSeconds:
+      ringDurationSeconds > 0
+        ? ringDurationSeconds
+        : null,
+  };
+
   const args = [
     "-i",
     interfaceName,
-    "-c",
-    String(count),
     "-l",
     "-T",
     "fields",
@@ -1329,11 +1547,79 @@ export function startTSharkCapture(options?: {
     "tcp.analysis.zero_window",
   ];
 
+  if (count !== null) {
+    args.splice(
+      2,
+      0,
+      "-c",
+      String(count),
+    );
+  }
+
+  if (!promiscuous) {
+    args.push("-p");
+  }
+
+  if (monitorMode) {
+    args.push("-I");
+  }
+
+  if (snapshotLength > 0) {
+    args.push(
+      "-s",
+      String(snapshotLength)
+    );
+  }
+
+  if (bufferSizeMb > 0) {
+    args.push(
+      "-B",
+      String(bufferSizeMb)
+    );
+  }
+
+  if (durationSeconds > 0) {
+    args.push(
+      "-a",
+      `duration:${durationSeconds}`
+    );
+  }
+
   if (captureFilter) {
     args.push("-f", captureFilter);
   }
 
-  captureProcess = spawn("tshark", args, {
+  if (captureFile) {
+    args.push("-w", captureFile);
+  }
+
+  if (ringEnabled) {
+    if (ringFileSizeMb > 0) {
+      args.push(
+        "-b",
+        `filesize:${ringFileSizeMb * 1024}`
+      );
+    }
+
+    if (ringFileCount > 0) {
+      args.push(
+        "-b",
+        `files:${ringFileCount}`
+      );
+    }
+
+    if (ringDurationSeconds > 0) {
+      args.push(
+        "-b",
+        `duration:${ringDurationSeconds}`
+      );
+    }
+  }
+
+  const tsharkBinary =
+    process.env.TSHARK_BINARY || "/usr/bin/tshark";
+
+  captureProcess = spawn(tsharkBinary, args, {
     stdio: ["ignore", "pipe", "pipe"],
   });
 

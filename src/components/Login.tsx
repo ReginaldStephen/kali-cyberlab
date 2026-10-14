@@ -83,7 +83,7 @@ export function Login({ onLogin }: LoginProps) {
         }),
       });
 
-      const data = await response.json().catch(() => null);
+      const data = await response.json    ().catch(() => null);
 
       if (!response.ok) {
         throw new Error(
@@ -147,7 +147,7 @@ export function Login({ onLogin }: LoginProps) {
         className="absolute inset-0"
         style={{
           background:
-            "radial-gradient(circle at center, rgba(6,182,212,0.16), rgba(0,0,0,0.72) 60%, rgba(0,0,0,0.94) 100%)",
+            "radial-gradient(circle at center, rgba(127,29,29,0.18), rgba(0,0,0,0.72) 60%, rgba(0,0,0,0.94) 100%)",
         }}
       />
 
@@ -155,9 +155,9 @@ export function Login({ onLogin }: LoginProps) {
           RED CYBERLAB LIGHTING
       ============================================================ */}
 
-      <div className="absolute -left-32 top-1/3 h-96 w-96 rounded-full bg-cyan-500/10 blur-[120px]" />
+      <div className="absolute -left-32 top-1/3 h-96 w-96 rounded-full bg-red-700/10 blur-[120px]" />
 
-      <div className="absolute -right-32 bottom-1/4 h-96 w-96 rounded-full bg-cyan-500/10 blur-[120px]" />
+      <div className="absolute -right-32 bottom-1/4 h-96 w-96 rounded-full bg-red-700/10 blur-[120px]" />
 
       {/* ============================================================
           CYBER GRID
@@ -167,7 +167,7 @@ export function Login({ onLogin }: LoginProps) {
         className="absolute inset-0 opacity-[0.13]"
         style={{
           backgroundImage:
-            "linear-gradient(rgba(34,211,238,0.22) 1px, transparent 1px), linear-gradient(90deg, rgba(34,211,238,0.22) 1px, transparent 1px)",
+            "linear-gradient(rgba(248,113,113,0.25) 1px, transparent 1px), linear-gradient(90deg, rgba(248,113,113,0.25) 1px, transparent 1px)",
           backgroundSize: "50px 50px",
         }}
       />
@@ -188,10 +188,10 @@ export function Login({ onLogin }: LoginProps) {
           TOP STATUS BAR
       ============================================================ */}
 
-      <div className="absolute left-0 right-0 top-0 z-20 border-b border-cyan-500/10 bg-black/25 px-5 py-3 backdrop-blur-sm">
+      <div className="absolute left-0 right-0 top-0 z-20 border-b border-red-500/10 bg-black/25 px-5 py-3 backdrop-blur-sm">
         <div className="mx-auto flex max-w-7xl items-center justify-between text-[8px] uppercase tracking-[0.25em] text-slate-500">
           <div className="flex items-center gap-3">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400 shadow-lg shadow-cyan-400/70" />
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-red-500 shadow-lg shadow-red-500/70" />
             <span>CyberLab Security Network</span>
           </div>
 
@@ -219,15 +219,15 @@ export function Login({ onLogin }: LoginProps) {
 
             <div className="mb-5 inline-flex items-center justify-center">
 
-              <div className="relative flex h-20 w-20 items-center justify-center rounded-2xl border border-cyan-500/40 bg-black/50 shadow-2xl shadow-cyan-950/50 backdrop-blur-xl">
+              <div className="relative flex h-20 w-20 items-center justify-center rounded-2xl border border-red-500/40 bg-black/50 shadow-2xl shadow-red-950/50 backdrop-blur-xl">
 
-                <div className="absolute inset-2 rounded-xl border border-cyan-500/20" />
+                <div className="absolute inset-2 rounded-xl border border-red-500/20" />
 
-                <div className="absolute h-10 w-10 rounded-full border border-cyan-400/60" />
+                <div className="absolute h-10 w-10 rounded-full border border-red-500/60" />
 
-                <div className="absolute h-6 w-6 rounded-full border-2 border-cyan-400 shadow-lg shadow-cyan-400/50" />
+                <div className="absolute h-6 w-6 rounded-full border-2 border-red-500 shadow-lg shadow-red-500/50" />
 
-                <div className="h-2.5 w-2.5 rounded-full bg-cyan-400 shadow-[0_0_20px_rgba(239,68,68,0.9)]" />
+                <div className="h-2.5 w-2.5 rounded-full bg-red-500 shadow-[0_0_20px_rgba(239,68,68,0.9)]" />
 
               </div>
 
@@ -235,7 +235,7 @@ export function Login({ onLogin }: LoginProps) {
 
             <h1 className="text-3xl font-black tracking-[0.16em] text-white drop-shadow-2xl sm:text-4xl">
               KALI{" "}
-              <span className="text-cyan-400">
+              <span className="text-red-500">
                 CYBERLAB
               </span>
             </h1>
@@ -253,7 +253,7 @@ export function Login({ onLogin }: LoginProps) {
           <div className="overflow-hidden rounded-2xl border border-white/10 bg-black/65 shadow-2xl shadow-black/70 backdrop-blur-2xl">
 
             {/* Panel top line */}
-            <div className="h-px w-full bg-gradient-to-r from-transparent via-cyan-500 to-transparent" />
+            <div className="h-px w-full bg-gradient-to-r from-transparent via-red-500 to-transparent" />
 
             {/* Header */}
             <div className="border-b border-white/10 px-6 py-5">
@@ -263,8 +263,8 @@ export function Login({ onLogin }: LoginProps) {
                 <div className="flex items-center gap-3">
 
                   <div className="relative">
-                    <span className="block h-2 w-2 rounded-full bg-cyan-400 shadow-lg shadow-cyan-400/70" />
-                    <span className="absolute inset-0 animate-ping rounded-full bg-cyan-400 opacity-30" />
+                    <span className="block h-2 w-2 rounded-full bg-red-500 shadow-lg shadow-red-500/70" />
+                    <span className="absolute inset-0 animate-ping rounded-full bg-red-500 opacity-30" />
                   </div>
 
                   <div>
@@ -307,7 +307,7 @@ export function Login({ onLogin }: LoginProps) {
                     </div>
 
                     <div>
-                      <div className="text-[8px] font-bold uppercase tracking-[0.18em] text-cyan-400">
+                      <div className="text-[8px] font-bold uppercase tracking-[0.18em] text-red-400">
                         Authentication Error
                       </div>
 
@@ -333,7 +333,7 @@ export function Login({ onLogin }: LoginProps) {
 
                 <div className="group relative">
 
-                  <div className="pointer-events-none absolute inset-y-0 left-0 flex w-11 items-center justify-center border-r border-slate-800 text-slate-600 transition group-focus-within:border-cyan-500/30 group-focus-within:text-cyan-400">
+                  <div className="pointer-events-none absolute inset-y-0 left-0 flex w-11 items-center justify-center border-r border-slate-800 text-slate-600 transition group-focus-within:border-red-500/30 group-focus-within:text-red-500">
                     <span className="text-xs">
                       &gt;_
                     </span>
@@ -350,7 +350,7 @@ export function Login({ onLogin }: LoginProps) {
                     autoFocus
                     disabled={isLoading}
                     placeholder="Enter operator username"
-                    className="w-full rounded-lg border border-slate-800 bg-black/50 py-3.5 pl-14 pr-4 text-sm text-white outline-none transition placeholder:text-slate-700 focus:border-cyan-400/60 focus:bg-black/70 focus:ring-1 focus:ring-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                    className="w-full rounded-lg border border-slate-800 bg-black/50 py-3.5 pl-14 pr-4 text-sm text-white outline-none transition placeholder:text-slate-700 focus:border-red-500/60 focus:bg-black/70 focus:ring-1 focus:ring-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                   />
 
                 </div>
@@ -369,7 +369,7 @@ export function Login({ onLogin }: LoginProps) {
 
                 <div className="group relative">
 
-                  <div className="pointer-events-none absolute inset-y-0 left-0 flex w-11 items-center justify-center border-r border-slate-800 text-slate-600 transition group-focus-within:border-cyan-500/30 group-focus-within:text-cyan-400">
+                  <div className="pointer-events-none absolute inset-y-0 left-0 flex w-11 items-center justify-center border-r border-slate-800 text-slate-600 transition group-focus-within:border-red-500/30 group-focus-within:text-red-500">
                     <span className="text-xs">
                       ●●
                     </span>
@@ -385,7 +385,7 @@ export function Login({ onLogin }: LoginProps) {
                     autoComplete="current-password"
                     disabled={isLoading}
                     placeholder="Enter security credential"
-                    className="w-full rounded-lg border border-slate-800 bg-black/50 py-3.5 pl-14 pr-4 text-sm text-white outline-none transition placeholder:text-slate-700 focus:border-cyan-400/60 focus:bg-black/70 focus:ring-1 focus:ring-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                    className="w-full rounded-lg border border-slate-800 bg-black/50 py-3.5 pl-14 pr-4 text-sm text-white outline-none transition placeholder:text-slate-700 focus:border-red-500/60 focus:bg-black/70 focus:ring-1 focus:ring-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                   />
 
                 </div>
@@ -396,7 +396,7 @@ export function Login({ onLogin }: LoginProps) {
               <button
                 type="submit"
                 disabled={isLoading}
-                className="group relative w-full overflow-hidden rounded-lg border border-cyan-500/50 bg-cyan-700/90 px-4 py-4 text-[10px] font-black uppercase tracking-[0.25em] text-white shadow-lg shadow-cyan-950/30 transition duration-300 hover:border-cyan-300 hover:bg-cyan-600 hover:shadow-xl hover:shadow-cyan-900/40 disabled:cursor-not-allowed disabled:opacity-70"
+                className="group relative w-full overflow-hidden rounded-lg border border-red-500/50 bg-red-700/90 px-4 py-4 text-[10px] font-black uppercase tracking-[0.25em] text-white shadow-lg shadow-red-950/30 transition duration-300 hover:border-red-400 hover:bg-red-600 hover:shadow-xl hover:shadow-red-900/40 disabled:cursor-not-allowed disabled:opacity-70"
               >
 
                 <div className="absolute inset-0 -translate-x-full bg-gradient-to-r from-transparent via-white/10 to-transparent transition-transform duration-700 group-hover:translate-x-full" />
@@ -422,13 +422,13 @@ export function Login({ onLogin }: LoginProps) {
 
               {/* Authentication sequence */}
               {isLoading && (
-                <div className="mt-5 rounded-lg border border-cyan-500/10 bg-cyan-950/10 px-4 py-3">
+                <div className="mt-5 rounded-lg border border-red-500/10 bg-red-950/10 px-4 py-3">
 
                   <div className="flex items-center gap-2">
 
-                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400" />
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-red-500" />
 
-                    <span className="text-[8px] uppercase tracking-[0.18em] text-cyan-400">
+                    <span className="text-[8px] uppercase tracking-[0.18em] text-red-400">
                       {authStep}
                     </span>
 
@@ -436,7 +436,7 @@ export function Login({ onLogin }: LoginProps) {
 
                   <div className="mt-3 h-0.5 overflow-hidden rounded-full bg-slate-800">
 
-                    <div className="h-full w-1/2 animate-pulse bg-cyan-400 shadow-lg shadow-cyan-400" />
+                    <div className="h-full w-1/2 animate-pulse bg-red-500 shadow-lg shadow-red-500" />
 
                   </div>
 
@@ -472,7 +472,7 @@ export function Login({ onLogin }: LoginProps) {
                 aria-label={`Show background ${index + 1}`}
                 className={`h-1 rounded-full transition-all duration-500 ${
                   currentImage === index
-                    ? "w-7 bg-cyan-400 shadow-lg shadow-cyan-400/50"
+                    ? "w-7 bg-red-500 shadow-lg shadow-red-500/50"
                     : "w-2 bg-white/20 hover:bg-white/40"
                 }`}
               />

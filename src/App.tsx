@@ -24,11 +24,16 @@ import { ReportAILibrary } from "./components/ReportAILibrary";
 import { KaliMigrationGuide } from "./components/KaliMigrationGuide";
 import { PythonEngineViewer } from "./components/PythonEngineViewer";
 import { ScanHistoryDrawer } from "./components/ScanHistoryDrawer";
+import type { CyberLabAIAction } from "./types/cyberlabAI";
 import { SecurityToolsHub } from "./components/SecurityToolsHub";
 import { SecurityArsenal } from "./components/SecurityArsenal";
+import { BurpDashboard } from "./components/BurpDashboard";
 import { ObserviumDashboard } from "./components/ObserviumDashboard";
 import { GreenboneDashboard } from "./components/GreenboneDashboard";
 import { TSharkDashboard } from "./components/TSharkDashboard";
+import { HttpxDashboard } from "./components/HttpxDashboard";
+import WarRoomDashboard from "./components/WarRoomDashboard";
+import { WazuhDashboard } from "./components/WazuhDashboard";
 import { AISecurityBuddy } from "./components/AISecurityBuddy";
 import { ActivityCenter } from "./components/ActivityCenter";
 import { Login } from "./components/Login";
@@ -37,6 +42,17 @@ import { CyberLabHome } from "./components/CyberLabHome";
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>("home");
   const [showReportAILibrary, setShowReportAILibrary] = useState<boolean>(false);
+  const [aiGreenboneReportId, setAIGreenboneReportId] =
+    useState<string | null>(null);
+
+  const [aiGreenboneHighlight, setAIGreenboneHighlight] =
+    useState<
+      | {
+          field: "severity" | "name" | "host" | "port" | "oid";
+          value: string;
+        }
+      | null
+    >(null);
 
   // CyberLab Authentication
   const [authUser, setAuthUser] = useState<any>(null);
@@ -65,38 +81,46 @@ export default function App() {
   const [reauthResetKey, setReauthResetKey] =
     useState<number>(0);
   
-  // Check whether a valid CyberLab session already exists.
+  // ============================================================
+  // FRESH PAGE LOAD SECURITY
+  //
+  // A browser refresh or a completely new page load must NOT
+  // restore an existing CyberLab browser session.
+  //
+  // SPA navigation does not remount App, so this only runs when
+  // the application itself is loaded again.
+  //
+  // This deliberately invalidates the existing web session before
+  // displaying the Login page. Backend services and operations
+  // are not stopped by this.
+  // ============================================================
   useEffect(() => {
     let mounted = true;
 
-    const checkAuthentication = async () => {
+    const initializeFreshPageSession = async () => {
       try {
-        const response = await fetch("/api/auth/me", {
+        await fetch("/api/auth/logout", {
+          method: "POST",
           credentials: "include",
         });
-
+      } catch (error) {
+        console.error(
+          "Fresh page session reset failed:",
+          error
+        );
+      } finally {
         if (!mounted) return;
 
-        if (response.ok) {
-          const data = await response.json();
-          setAuthUser(data.user || null);
-        } else {
-          setAuthUser(null);
-        }
-      } catch (error) {
-        console.error("Authentication check failed:", error);
-
-        if (mounted) {
-          setAuthUser(null);
-        }
-      } finally {
-        if (mounted) {
-          setAuthChecking(false);
-        }
+        setAuthUser(null);
+        setIsSecurityLocked(false);
+        setReauthPassword("");
+        setReauthError("");
+        setReauthSuccess(false);
+        setAuthChecking(false);
       }
     };
 
-    checkAuthentication();
+    initializeFreshPageSession();
 
     return () => {
       mounted = false;
@@ -646,16 +670,41 @@ export default function App() {
       window.open(url, "_blank", "noopener,noreferrer");
     }}
     onOpenObservium={() => {
-      setActiveTab("observium");
+      window.open(
+        `http://${window.location.hostname}:8081/`,
+        "_blank",
+        "noopener,noreferrer"
+      );
     }}
     onOpenGreenbone={() => {
-      setActiveTab("greenbone");
+      window.open(
+        `https://${window.location.hostname}:9392/`,
+        "_blank",
+        "noopener,noreferrer"
+      );
     }}
     onOpenTShark={() => {
       setActiveTab("tshark");
     }}
+    onOpenBurp={() => {
+      setActiveTab("burp");
+    }}
+    onOpenHttpx={() => {
+      setActiveTab("httpx");
+    }}
+    onOpenWazuh={() => {
+      setActiveTab("wazuh");
+    }}
   />
 )}
+{activeTab === "burp" && (
+  <BurpDashboard
+    onBack={() => {
+      setActiveTab("arsenal");
+    }}
+  />
+)}
+
 {activeTab === "observium" && (
   <ObserviumDashboard
     onBack={() => {
@@ -667,6 +716,14 @@ export default function App() {
 
 {activeTab === "greenbone" && (
   <GreenboneDashboard
+    aiSelectedReportId={aiGreenboneReportId}
+    onAISelectionHandled={() => {
+      setAIGreenboneReportId(null);
+    }}
+    aiHighlightFinding={aiGreenboneHighlight}
+    onAIHighlightHandled={() => {
+      setAIGreenboneHighlight(null);
+    }}
     onBack={() => {
       setActiveTab("arsenal");
     }}
@@ -675,6 +732,30 @@ export default function App() {
 
 {activeTab === "tshark" && (
   <TSharkDashboard
+    onBack={() => {
+      setActiveTab("arsenal");
+    }}
+  />
+)}
+
+{activeTab === "httpx" && (
+  <HttpxDashboard
+    onBack={() => {
+      setActiveTab("arsenal");
+    }}
+  />
+)}
+
+{activeTab === "wazuh" && (
+  <WazuhDashboard
+    onBack={() => {
+      setActiveTab("arsenal");
+    }}
+  />
+)}
+
+{activeTab === "warroom" && (
+  <WarRoomDashboard
     onBack={() => {
       setActiveTab("arsenal");
     }}
@@ -708,7 +789,36 @@ export default function App() {
           AI SECURITY BUDDY
           Floating assistant available across CyberLab
           ============================================================ */}
-      <AISecurityBuddy />
+      <AISecurityBuddy
+        onAction={(action: CyberLabAIAction) => {
+          console.log("[CyberLab AI ACTION]", action);
+
+          if (action.type === "OPEN_MODULE") {
+            setActiveTab(action.module);
+            return;
+          }
+
+          if (
+            action.type === "SELECT" &&
+            action.target === "greenbone_report"
+          ) {
+            setActiveTab("greenbone");
+            setAIGreenboneReportId(action.id);
+            return;
+          }
+
+          if (
+            action.type === "HIGHLIGHT" &&
+            action.target === "greenbone_finding"
+          ) {
+            setActiveTab("greenbone");
+            setAIGreenboneHighlight({
+              field: action.field,
+              value: action.value,
+            });
+          }
+        }}
+      />
 
       {/* ============================================================
           15-MINUTE SECURITY LOCK SCREEN

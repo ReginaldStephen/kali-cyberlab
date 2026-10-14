@@ -7,3 +7,19 @@ coverage/
 .env*
 !.env.example
 .env
+
+# Local TLS certificates and private keys
+certs/
+
+# Runtime data, reports, captures, and traffic history
+data/
+
+# Temporary editor and patch backups
+*.before-*
+*.backup-*
+*.bak
+
+# Additional temporary backup naming patterns
+*.backup
+*.bak-*
+*.polished-backup

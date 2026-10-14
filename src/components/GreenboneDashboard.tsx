@@ -1,6 +1,7 @@
 import React, {
   useCallback,
   useEffect,
+  useRef,
   useState,
 } from "react";
 import {
@@ -72,10 +73,21 @@ interface GreenboneReportSummary {
 
 interface GreenboneDashboardProps {
   onBack: () => void;
+  aiSelectedReportId?: string | null;
+  onAISelectionHandled?: () => void;
+  aiHighlightFinding?: {
+    field: "severity" | "name" | "host" | "port" | "oid";
+    value: string;
+  } | null;
+  onAIHighlightHandled?: () => void;
 }
 
 export const GreenboneDashboard: React.FC<GreenboneDashboardProps> = ({
   onBack,
+  aiSelectedReportId,
+  onAISelectionHandled,
+  aiHighlightFinding,
+  onAIHighlightHandled,
 }) => {
 const [greenboneTasks, setGreenboneTasks] =
   useState<GreenboneTask[]>([]);
@@ -103,6 +115,14 @@ const [greenboneReportLoading, setGreenboneReportLoading] =
 
 const [greenboneReportError, setGreenboneReportError] =
   useState<string | null>(null);
+
+  const [aiHighlightedFindingIds, setAIHighlightedFindingIds] =
+    useState<string[]>([]);
+
+  const findingRefs = useRef<
+    Record<string, HTMLDivElement | null>
+  >({});
+
  
   const [greenboneScanName, setGreenboneScanName] =
     useState("");
@@ -773,7 +793,151 @@ const loadGreenboneReport = useCallback(
   []
 );
 
- 
+  useEffect(() => {
+    if (!aiSelectedReportId) {
+      return;
+    }
+
+    const reportId = aiSelectedReportId;
+
+    onAISelectionHandled?.();
+    setAIHighlightedFindingIds([]);
+    void loadGreenboneReport(reportId);
+  }, [
+    aiSelectedReportId,
+    onAISelectionHandled,
+    loadGreenboneReport,
+  ]);
+
+  useEffect(() => {
+    if (!aiHighlightFinding) {
+      return;
+    }
+
+    if (!selectedGreenboneReport) {
+      console.log(
+        "[Greenbone AI HIGHLIGHT WAITING FOR REPORT]",
+        {
+          aiHighlightFinding,
+          selectedGreenboneReport,
+        }
+      );
+      return;
+    }
+
+    if (!greenboneReportSummary) {
+      console.log("[Greenbone AI HIGHLIGHT WAIT]", {
+        aiHighlightFinding,
+        selectedGreenboneReport,
+        reportLoaded: false,
+        findingCount: 0,
+      });
+      return;
+    }
+
+    console.log(
+      "[Greenbone AI HIGHLIGHT REQUEST]",
+      {
+        aiHighlightFinding,
+        selectedGreenboneReport,
+      }
+    );
+
+    console.log(
+      "[Greenbone AI HIGHLIGHT FINDINGS]",
+      greenboneReportSummary.findings.map((finding) => ({
+        id: finding.id,
+        severity: finding.severity,
+        name: finding.name,
+        host: finding.host,
+        port: finding.port,
+        oid: finding.oid,
+      }))
+    );
+
+    const normalizeHighlightValue = (
+      field: "severity" | "name" | "host" | "port" | "oid",
+      value: string
+    ) => {
+      const normalized = value.trim().toLowerCase();
+
+      if (field === "host") {
+        return normalized
+          .replace(/\s+/g, "")
+          .replace(/\s*\([^)]*\)$/, "");
+      }
+
+      if (field !== "port") {
+        return normalized;
+      }
+
+      return normalized
+        .replace(/\s+/g, "")
+        .replace(/^tcp\//, "")
+        .replace(/\/tcp$/, "")
+        .replace(/^udp\//, "")
+        .replace(/\/udp$/, "");
+    };
+
+    const requestedValue = normalizeHighlightValue(
+      aiHighlightFinding.field,
+      aiHighlightFinding.value
+    );
+
+    const matchedFindings =
+      greenboneReportSummary.findings.filter((finding) => {
+        const actualValue = normalizeHighlightValue(
+          aiHighlightFinding.field,
+          String(finding[aiHighlightFinding.field])
+        );
+
+        return actualValue === requestedValue;
+      });
+
+    if (matchedFindings.length === 0) {
+      console.warn(
+        "[Greenbone AI HIGHLIGHT NO MATCH]",
+        {
+          reportId: selectedGreenboneReport,
+          field: aiHighlightFinding.field,
+          requestedValue,
+        }
+      );
+      onAIHighlightHandled?.();
+      return;
+    }
+
+    console.log(
+      "[Greenbone AI HIGHLIGHT MATCHES]",
+      {
+        reportId: selectedGreenboneReport,
+        field: aiHighlightFinding.field,
+        requestedValue,
+        matchCount: matchedFindings.length,
+        findings: matchedFindings,
+      }
+    );
+
+    const matchedFindingIds = matchedFindings.map(
+      (finding) => finding.id
+    );
+
+    setAIHighlightedFindingIds(matchedFindingIds);
+    onAIHighlightHandled?.();
+
+    window.setTimeout(() => {
+      findingRefs.current[matchedFindings[0].id]?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }, 50);
+  }, [
+    aiHighlightFinding,
+    selectedGreenboneReport,
+    greenboneReportSummary,
+    onAIHighlightHandled,
+  ]);
+
   useEffect(() => {
     loadGreenboneProfiles();
     loadGreenboneTasks();
@@ -1557,8 +1721,23 @@ const loadGreenboneReport = useCallback(
                     (finding) => (
                       <div
                         key={finding.id}
-                        className="rounded-xl border border-slate-800 bg-slate-900/60 p-4"
+                        ref={(element) => {
+                          findingRefs.current[finding.id] = element;
+                        }}
+                        className={`rounded-xl border p-4 transition-all duration-500 ${
+                          aiHighlightedFindingIds.includes(finding.id)
+                            ? "border-emerald-400/80 bg-emerald-500/10 shadow-lg shadow-emerald-500/10 ring-2 ring-emerald-400/30"
+                            : "border-slate-800 bg-slate-900/60"
+                        }`}
                       >
+                        {aiHighlightedFindingIds.includes(finding.id) && (
+                          <div className="mb-3 flex items-center gap-2 rounded border border-emerald-400/30 bg-emerald-500/10 px-2 py-1">
+                            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+                            <span className="text-[8px] font-bold uppercase tracking-widest text-emerald-300">
+                              AI HIGHLIGHT
+                            </span>
+                          </div>
+                        )}
                         <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                           <div className="min-w-0">
                             <div className="text-[11px] font-bold leading-5 text-slate-200">

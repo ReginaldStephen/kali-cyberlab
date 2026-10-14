@@ -1,5 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
+import type { CyberLabAIAction } from "../types/cyberlabAI";
 import {
+  Activity,
+  ChevronDown,
+  ChevronUp,
   Bot,
   Send,
   ShieldCheck,
@@ -11,6 +15,10 @@ import {
   X,
   MessageCircle,
   Minimize2,
+  Mic,
+  MicOff,
+  Volume2,
+  Square,
 } from "lucide-react";
 
 const normalizeAIContent = (content: string) => {
@@ -207,7 +215,64 @@ interface Message {
   content: string;
 }
 
-export const AISecurityBuddy: React.FC = () => {
+type SpeechRecognitionEventLike = Event & {
+  results: SpeechRecognitionResultList;
+};
+
+interface SpeechRecognitionInstance {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onstart: (() => void) | null;
+  onend: (() => void) | null;
+  onerror: ((event: any) => void) | null;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+}
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionInstance;
+
+declare global {
+  interface Window {
+    SpeechRecognition?: SpeechRecognitionConstructor;
+    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+  }
+}
+
+interface CyberLabAIRuntimeRequestRecord {
+  timestamp: string;
+  providerId: string;
+  providerDisplayName: string;
+  requestedModel: string;
+  returnedModel: string | null;
+  attempt: number;
+  success: boolean;
+  statusCode: number | null;
+  error: string | null;
+}
+
+interface CyberLabAIRuntimeStatus {
+  providerId: string | null;
+  providerDisplayName: string | null;
+  requestedModel: string | null;
+  returnedModel: string | null;
+  status: "idle" | "success" | "error";
+  lastRequestAt: string | null;
+  lastSuccessAt: string | null;
+  lastErrorAt: string | null;
+  lastError: string | null;
+  recentRequests: CyberLabAIRuntimeRequestRecord[];
+}
+
+interface AISecurityBuddyProps {
+  onAction?: (action: CyberLabAIAction) => void;
+}
+
+export const AISecurityBuddy: React.FC<AISecurityBuddyProps> = ({
+  onAction,
+}) => {
   const [isOpen, setIsOpen] = useState(false);
 
   const [messages, setMessages] = useState<Message[]>([
@@ -224,8 +289,52 @@ export const AISecurityBuddy: React.FC = () => {
   const [errorMessage, setErrorMessage] = useState("");
   const [retrySeconds, setRetrySeconds] = useState(0);
 
+  const [aiRuntime, setAIRuntime] =
+    useState<CyberLabAIRuntimeStatus | null>(null);
+
+  const [availableAIModels, setAvailableAIModels] =
+    useState<string[]>([]);
+
+  const [selectedAIModel, setSelectedAIModel] =
+    useState("");
+
+  const [aiRuntimeError, setAIRuntimeError] =
+    useState("");
+
+  const [isLoadingAIRuntime, setIsLoadingAIRuntime] =
+    useState(false);
+
+  const [isAIRoutingHistoryOpen, setIsAIRoutingHistoryOpen] =
+    useState(false);
+
+  const [voicePermission, setVoicePermission] = useState<
+    "unknown" | "requesting" | "granted" | "denied"
+  >("unknown");
+
+  const [voiceState, setVoiceState] = useState<
+    "off" | "standby" | "listening" | "processing" | "speaking"
+  >("off");
+
+  const [voiceError, setVoiceError] = useState("");
+
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const wakeRecognitionRef =
+    useRef<SpeechRecognitionInstance | null>(null);
+
+  const commandRecognitionRef =
+    useRef<SpeechRecognitionInstance | null>(null);
+
+  // Wait for a sustained pause before submitting a spoken command.
+  // This prevents partial speech from being sent while the user is still talking.
+  const commandSilenceTimerRef = useRef<number | null>(null);
+  const commandTranscriptRef = useRef("");
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const attentiveRef = useRef(false);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
     if (!isOpen) {
@@ -259,12 +368,777 @@ export const AISecurityBuddy: React.FC = () => {
   }, [retrySeconds]);
 
   useEffect(() => {
+    mountedRef.current = true;
+
+    void requestVoiceAccess();
+
+    return () => {
+      mountedRef.current = false;
+
+      wakeRecognitionRef.current?.abort();
+      commandRecognitionRef.current?.abort();
+
+      wakeRecognitionRef.current = null;
+      commandRecognitionRef.current = null;
+
+      if (audioRef.current) {
+        audioRef.current.pause();
+
+        if (audioRef.current.src.startsWith("blob:")) {
+          URL.revokeObjectURL(audioRef.current.src);
+        }
+
+        audioRef.current = null;
+      }
+    };
+  }, []);
+
+  const loadAIRuntimeStatus = async () => {
+    if (!mountedRef.current) {
+      return;
+    }
+
+    setIsLoadingAIRuntime(true);
+
+    try {
+      const response = await fetch("/api/ai/status", {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          Accept: "application/json",
+        },
+      });
+
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        throw new Error(
+          data?.error ||
+            `CyberLab AI status returned ${response.status}.`
+        );
+      }
+
+      if (!data?.runtime) {
+        throw new Error(
+          "CyberLab AI runtime status was not returned."
+        );
+      }
+
+      const providerModels = Array.isArray(data?.providers)
+        ? data.providers
+            .flatMap((provider: any) =>
+              Array.isArray(provider?.models)
+                ? provider.models
+                : []
+            )
+            .filter(
+              (model: unknown): model is string =>
+                typeof model === "string" &&
+                model.trim().length > 0
+            )
+        : [];
+
+      const uniqueProviderModels = Array.from(
+        new Set(providerModels)
+      );
+
+      if (mountedRef.current) {
+        setAIRuntime(data.runtime);
+        setAvailableAIModels(uniqueProviderModels);
+        setAIRuntimeError("");
+      }
+    } catch (error: any) {
+      console.error(
+        "CyberLab AI runtime status error:",
+        error
+      );
+
+      if (mountedRef.current) {
+        setAIRuntimeError(
+          error?.message ||
+            "Unable to retrieve AI runtime status."
+        );
+      }
+    } finally {
+      if (mountedRef.current) {
+        setIsLoadingAIRuntime(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    void loadAIRuntimeStatus();
+
+    const timer = window.setInterval(() => {
+      void loadAIRuntimeStatus();
+    }, 15000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
     if (isOpen) {
       window.setTimeout(() => {
         inputRef.current?.focus();
       }, 100);
     }
   }, [isOpen]);
+
+  const getSpeechRecognitionConstructor =
+    (): SpeechRecognitionConstructor | null => {
+      return (
+        window.SpeechRecognition ||
+        window.webkitSpeechRecognition ||
+        null
+      );
+    };
+
+  const stopSpeaking = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+
+      if (audioRef.current.src.startsWith("blob:")) {
+        URL.revokeObjectURL(audioRef.current.src);
+      }
+
+      audioRef.current = null;
+    }
+
+    if (mountedRef.current) {
+      setVoiceState(
+        voicePermission === "granted" ? "standby" : "off"
+      );
+    }
+  };
+
+  const speakResponse = async (text: string) => {
+    try {
+      if (!text.trim()) {
+        return;
+      }
+
+      stopSpeaking();
+
+      if (mountedRef.current) {
+        setVoiceState("speaking");
+      }
+
+      const response = await fetch("/api/ai/speech", {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          text: text.trim(),
+        }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+
+        throw new Error(
+          data?.error ||
+            `Voice response failed with status ${response.status}.`
+        );
+      }
+
+      const audioBlob = await response.blob();
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+
+      audioRef.current = audio;
+
+      audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+        audioRef.current = null;
+
+        if (
+          mountedRef.current &&
+          voicePermission === "granted"
+        ) {
+          setVoiceState("standby");
+
+          if (!attentiveRef.current) {
+            startWakeWordListening();
+          }
+        }
+      };
+
+      audio.onerror = () => {
+        URL.revokeObjectURL(audioUrl);
+        audioRef.current = null;
+
+        if (mountedRef.current) {
+          setVoiceError(
+            "CyberLab could not play the voice response."
+          );
+
+          setVoiceState(
+            voicePermission === "granted" ? "standby" : "off"
+          );
+        }
+      };
+
+      await audio.play();
+    } catch (error: any) {
+      console.error("CyberLab voice output error:", error);
+
+      if (mountedRef.current) {
+        setVoiceError(
+          error?.message ||
+            "CyberLab could not generate the voice response."
+        );
+
+        setVoiceState(
+          voicePermission === "granted" ? "standby" : "off"
+        );
+      }
+    }
+  };
+
+  const sendVoiceMessage = async (message: string) => {
+    const trimmedMessage = message.trim();
+
+    if (!trimmedMessage || isLoading) {
+      return;
+    }
+
+    setMessages((current) => [
+      ...current,
+      {
+        id: Date.now(),
+        role: "user",
+        content: trimmedMessage,
+      },
+    ]);
+
+    setErrorMessage("");
+    setVoiceError("");
+    setIsLoading(true);
+    setVoiceState("processing");
+
+    try {
+      const response = await fetch("/api/ai/chat", {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: trimmedMessage,
+          ...(selectedAIModel
+            ? { model: selectedAIModel }
+            : {}),
+        }),
+      });
+
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        throw new Error(
+          data?.error ||
+            `CyberLab AI returned status ${response.status}.`
+        );
+      }
+
+      const aiReply =
+        typeof data?.reply === "string"
+          ? data.reply
+          : typeof data?.reply?.reply === "string"
+            ? data.reply.reply
+            : "";
+
+      const reply =
+        (aiReply ||
+          "I was unable to generate a response. Don't worry ReggieTech will fix it")
+          .replace(/&#x20;/g, " ");
+
+      setMessages((current) => [
+        ...current,
+        {
+          id: Date.now() + 1,
+          role: "assistant",
+          content: reply,
+        },
+      ]);
+
+      const actions = Array.isArray(data?.actions)
+        ? data.actions
+        : Array.isArray(data?.reply?.actions)
+          ? data.reply.actions
+          : [];
+
+      actions.forEach((action: CyberLabAIAction) => {
+        onAction?.(action);
+      });
+
+      await speakResponse(reply);
+    } catch (error: any) {
+      console.error("CyberLab voice command error:", error);
+
+      if (mountedRef.current) {
+        setVoiceError(
+          error?.message ||
+            "CyberLab could not process the voice command."
+        );
+
+        setVoiceState(
+          voicePermission === "granted" ? "standby" : "off"
+        );
+      }
+    } finally {
+      if (mountedRef.current) {
+        setIsLoading(false);
+      }
+    }
+  };
+
+  const startCommandListening = () => {
+    const Recognition = getSpeechRecognitionConstructor();
+
+    if (!Recognition) {
+      setVoiceError(
+        "Speech recognition is not available in this browser."
+      );
+      setVoiceState("standby");
+      return;
+    }
+
+    commandRecognitionRef.current?.abort();
+
+    if (commandSilenceTimerRef.current !== null) {
+      window.clearTimeout(commandSilenceTimerRef.current);
+      commandSilenceTimerRef.current = null;
+    }
+
+    commandTranscriptRef.current = "";
+
+    const recognition = new Recognition();
+
+    commandRecognitionRef.current = recognition;
+
+    // Keep listening while the user is speaking. We finalize the command
+    // ourselves after 3 seconds of silence instead of trusting the browser
+    // to decide when the user has finished.
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    attentiveRef.current = true;
+
+    setVoiceState("listening");
+    setVoiceError("");
+
+    const finalizeCommand = () => {
+      if (commandSilenceTimerRef.current !== null) {
+        window.clearTimeout(commandSilenceTimerRef.current);
+        commandSilenceTimerRef.current = null;
+      }
+
+      const transcript = commandTranscriptRef.current
+        .replace(/\s+/g, " ")
+        .trim();
+
+      commandTranscriptRef.current = "";
+      commandRecognitionRef.current = null;
+      attentiveRef.current = false;
+
+      recognition.onresult = null;
+      recognition.onerror = null;
+      recognition.onend = null;
+
+      try {
+        recognition.stop();
+      } catch {
+        // Recognition may already have ended.
+      }
+
+      if (transcript) {
+        console.log(
+          "CyberLab voice command finalized after 3 seconds of silence:",
+          transcript
+        );
+
+        void sendVoiceMessage(transcript);
+      } else {
+        setVoiceState("standby");
+        startWakeWordListening();
+      }
+    };
+
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .map((result) => result[0]?.transcript || "")
+        .join(" ")
+        .trim();
+
+      if (transcript) {
+        commandTranscriptRef.current = transcript;
+      }
+
+      // Every new speech result resets the 3-second silence window.
+      if (commandSilenceTimerRef.current !== null) {
+        window.clearTimeout(commandSilenceTimerRef.current);
+      }
+
+      commandSilenceTimerRef.current = window.setTimeout(() => {
+        finalizeCommand();
+      }, 3000);
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error(
+        "CyberLab command speech recognition error:",
+        event
+      );
+
+      if (commandSilenceTimerRef.current !== null) {
+        window.clearTimeout(commandSilenceTimerRef.current);
+        commandSilenceTimerRef.current = null;
+      }
+
+      commandRecognitionRef.current = null;
+      attentiveRef.current = false;
+      commandTranscriptRef.current = "";
+
+      if (mountedRef.current) {
+        setVoiceError(
+          event?.error === "no-speech"
+            ? "I didn't hear a command."
+            : "CyberLab could not understand the voice command."
+        );
+
+        setVoiceState("standby");
+      }
+
+      startWakeWordListening();
+    };
+
+    recognition.onend = () => {
+      /*
+       * Chrome can end SpeechRecognition even when continuous=true.
+       * If we already have a silence timer running, allow it to finalize
+       * the accumulated command instead of submitting early.
+       */
+      if (
+        mountedRef.current &&
+        attentiveRef.current &&
+        commandTranscriptRef.current.trim()
+      ) {
+        console.log(
+          "CyberLab command recognition ended; waiting for the 3-second silence window."
+        );
+
+        if (commandSilenceTimerRef.current === null) {
+          commandSilenceTimerRef.current = window.setTimeout(() => {
+            finalizeCommand();
+          }, 3000);
+        }
+
+        return;
+      }
+
+      commandRecognitionRef.current = null;
+
+      if (
+        mountedRef.current &&
+        !attentiveRef.current &&
+        voicePermission === "granted"
+      ) {
+        setVoiceState("standby");
+        startWakeWordListening();
+      }
+    };
+
+    try {
+      recognition.start();
+
+      console.log(
+        "CyberLab command listener started — waiting for 3 seconds of silence before submitting."
+      );
+    } catch (error) {
+      console.error(
+        "CyberLab command recognition start error:",
+        error
+      );
+
+      if (commandSilenceTimerRef.current !== null) {
+        window.clearTimeout(commandSilenceTimerRef.current);
+        commandSilenceTimerRef.current = null;
+      }
+
+      commandRecognitionRef.current = null;
+      attentiveRef.current = false;
+      commandTranscriptRef.current = "";
+
+      setVoiceState("standby");
+      startWakeWordListening();
+    }
+  };
+
+  const startWakeWordListening = () => {
+    const Recognition = getSpeechRecognitionConstructor();
+
+    if (
+      !Recognition ||
+      !mountedRef.current ||
+      voicePermission !== "granted" ||
+      attentiveRef.current
+    ) {
+      return;
+    }
+
+    wakeRecognitionRef.current?.abort();
+
+    const recognition = new Recognition();
+
+    wakeRecognitionRef.current = recognition;
+
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    setVoiceState("standby");
+
+    recognition.onstart = () => {
+      console.log(
+        "CyberLab wake-word listener started."
+      );
+
+      if (mountedRef.current) {
+        setVoiceState("standby");
+      }
+    };
+
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .map((result) =>
+          Array.from(result)
+            .map(
+              (alternative) =>
+                alternative?.transcript || ""
+            )
+            .join(" ")
+        )
+        .join(" ")
+        .toLowerCase()
+        .replace(/[.,!?;:]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      console.log(
+        "CyberLab wake recognition:",
+        transcript
+      );
+
+      const normalizedWakePhrase = transcript
+        .replace(/\bcyber\s+lab\b/g, "cyberlab")
+        .replace(/\bcyber\s+labs\b/g, "cyberlabs")
+        .replace(/\bhey\s+cyber\s+lab\b/g, "hey cyberlab")
+        .replace(/\bfive\b/g, "5")
+        .replace(/\bfour\b/g, "4")
+        .replace(/\bthree\b/g, "3")
+        .replace(/\btwo\b/g, "2")
+        .replace(/\bone\b/g, "1")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      const wakeDetected =
+        normalizedWakePhrase.includes(
+          "hey cyberlab 54321"
+        ) ||
+        normalizedWakePhrase.includes(
+          "hey cyber lab 54321"
+        ) ||
+        normalizedWakePhrase.includes(
+          "hey cyberlab five four three two one"
+        ) ||
+        normalizedWakePhrase.includes(
+          "hey cyber lab five four three two one"
+        );
+
+      if (!wakeDetected) {
+        return;
+      }
+
+      console.log(
+        "CyberLab wake phrase detected:",
+        normalizedWakePhrase
+      );
+
+      attentiveRef.current = true;
+
+      wakeRecognitionRef.current?.stop();
+      wakeRecognitionRef.current = null;
+
+      setVoiceError("");
+      setVoiceState("listening");
+
+      window.setTimeout(() => {
+        if (
+          mountedRef.current &&
+          voicePermission === "granted"
+        ) {
+          startCommandListening();
+        }
+      }, 150);
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error(
+        "CyberLab wake-word recognition error:",
+        event
+      );
+
+      wakeRecognitionRef.current = null;
+
+      if (
+        mountedRef.current &&
+        voicePermission === "granted" &&
+        !attentiveRef.current
+      ) {
+        setVoiceError(
+          event?.error === "not-allowed"
+            ? "Microphone access was blocked by the browser."
+            : event?.error === "audio-capture"
+              ? "The microphone could not be accessed."
+              : ""
+        );
+
+        setVoiceState("standby");
+
+        window.setTimeout(() => {
+          if (
+            mountedRef.current &&
+            voicePermission === "granted" &&
+            !attentiveRef.current
+          ) {
+            startWakeWordListening();
+          }
+        }, 1000);
+      }
+    };
+
+    recognition.onend = () => {
+      wakeRecognitionRef.current = null;
+
+      console.log(
+        "CyberLab wake-word listener ended."
+      );
+
+      if (
+        mountedRef.current &&
+        voicePermission === "granted" &&
+        !attentiveRef.current
+      ) {
+        window.setTimeout(() => {
+          if (
+            mountedRef.current &&
+            voicePermission === "granted" &&
+            !attentiveRef.current
+          ) {
+            startWakeWordListening();
+          }
+        }, 250);
+      }
+    };
+
+    try {
+      recognition.start();
+
+      console.log(
+        "CyberLab is listening for: Hey CyberLab 54321"
+      );
+    } catch (error) {
+      console.error(
+        "CyberLab wake-word recognition start error:",
+        error
+      );
+
+      wakeRecognitionRef.current = null;
+    }
+  };
+
+  const requestVoiceAccess = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setVoicePermission("denied");
+      setVoiceState("off");
+      setVoiceError(
+        "This browser does not provide microphone access."
+      );
+      return;
+    }
+
+    setVoicePermission("requesting");
+    setVoiceError("");
+
+    try {
+      const stream =
+        await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+
+      stream.getTracks().forEach((track) => track.stop());
+
+      if (!mountedRef.current) {
+        return;
+      }
+
+      setVoicePermission("granted");
+      setVoiceState("standby");
+
+      window.setTimeout(() => {
+        if (mountedRef.current) {
+          startWakeWordListening();
+        }
+      }, 0);
+    } catch (error: any) {
+      console.error(
+        "CyberLab microphone permission error:",
+        error
+      );
+
+      if (!mountedRef.current) {
+        return;
+      }
+
+      setVoicePermission("denied");
+      setVoiceState("off");
+      setVoiceError(
+        "Microphone access was not granted. Text chat will continue to work normally."
+      );
+    }
+  };
+
+  const stopVoiceAssistant = () => {
+    attentiveRef.current = false;
+
+    if (commandSilenceTimerRef.current !== null) {
+      window.clearTimeout(commandSilenceTimerRef.current);
+      commandSilenceTimerRef.current = null;
+    }
+
+    commandTranscriptRef.current = "";
+
+    wakeRecognitionRef.current?.abort();
+    commandRecognitionRef.current?.abort();
+
+    wakeRecognitionRef.current = null;
+    commandRecognitionRef.current = null;
+
+    stopSpeaking();
+
+    if (mountedRef.current) {
+      setVoiceState("off");
+    }
+  };
 
   const sendMessage = async () => {
     const trimmedMessage = input.trim();
@@ -301,6 +1175,9 @@ export const AISecurityBuddy: React.FC = () => {
         credentials: "include",
         body: JSON.stringify({
           message: trimmedMessage,
+          ...(selectedAIModel
+            ? { model: selectedAIModel }
+            : {}),
         }),
       });
 
@@ -327,16 +1204,36 @@ export const AISecurityBuddy: React.FC = () => {
         );
       }
 
+      const aiReply =
+        typeof data?.reply === "string"
+          ? data.reply
+          : typeof data?.reply?.reply === "string"
+            ? data.reply.reply
+            : "";
+
+      const reply =
+        (aiReply ||
+          "I was unable to generate a response. Don't worry ReggieTech will fix it")
+          .replace(/&#x20;/g, " ");
+
       setMessages((current) => [
         ...current,
         {
           id: Date.now() + 1,
           role: "assistant",
-        content:
-       (data?.reply || "I was unable to generate a response. Don't worry ReggieTech will fix it")
-       .replace(/&#x20;/g, " "),
+          content: reply,
         },
       ]);
+
+      const actions = Array.isArray(data?.actions)
+        ? data.actions
+        : Array.isArray(data?.reply?.actions)
+          ? data.reply.actions
+          : [];
+
+      actions.forEach((action: CyberLabAIAction) => {
+        onAction?.(action);
+      });
     } catch (error: any) {
       console.error(
         "AI Security Buddy request failed:",
@@ -468,6 +1365,355 @@ export const AISecurityBuddy: React.FC = () => {
               Authorized defensive security use only. Verify
               commands and findings before applying changes.
             </p>
+          </div>
+
+          {/* AI Model Selector */}
+          <div className="border-b border-slate-800 bg-slate-950/80 px-4 py-2.5">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="font-mono text-[8px] font-bold uppercase tracking-wider text-slate-400">
+                  AI Model
+                </div>
+
+                <p className="mt-0.5 truncate font-mono text-[7px] text-slate-700">
+                  Select a model or allow automatic fallback
+                </p>
+              </div>
+
+              <div className="relative shrink-0">
+                <select
+                  value={selectedAIModel}
+                  onChange={(event) =>
+                    setSelectedAIModel(event.target.value)
+                  }
+                  disabled={isLoading || isLoadingAIRuntime}
+                  aria-label="Select CyberLab AI model"
+                  className="h-8 max-w-[190px] appearance-none rounded-md border border-cyan-500/20 bg-slate-900 px-7 pl-2.5 font-mono text-[8px] font-semibold text-cyan-300 outline-none transition-colors hover:border-cyan-400/40 focus:border-cyan-400/50 focus:ring-1 focus:ring-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="">
+                    Auto / Fallback
+                  </option>
+
+                  {availableAIModels.map((model) => (
+                    <option key={model} value={model}>
+                      {model}
+                    </option>
+                  ))}
+                </select>
+
+                <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3 w-3 -translate-y-1/2 text-cyan-500/60" />
+              </div>
+            </div>
+          </div>
+
+          {/* AI Runtime */}
+          <div className="border-b border-slate-800 bg-slate-950/80 px-4 py-2.5">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-cyan-500/20 bg-cyan-500/5">
+                  {isLoadingAIRuntime ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-400" />
+                  ) : aiRuntime?.status === "error" ? (
+                    <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
+                  ) : (
+                    <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+                  )}
+                </div>
+
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[8px] font-bold uppercase tracking-wider text-slate-400">
+                      AI Runtime
+                    </span>
+
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full ${
+                        aiRuntime?.status === "success"
+                          ? "animate-pulse bg-emerald-400"
+                          : aiRuntime?.status === "error"
+                            ? "bg-amber-400"
+                            : "bg-slate-600"
+                      }`}
+                    />
+
+                    <span
+                      className={`font-mono text-[7px] font-bold uppercase ${
+                        aiRuntime?.status === "success"
+                          ? "text-emerald-400"
+                          : aiRuntime?.status === "error"
+                            ? "text-amber-400"
+                            : "text-slate-600"
+                      }`}
+                    >
+                      {aiRuntime?.status === "success"
+                        ? "Online"
+                        : aiRuntime?.status === "error"
+                          ? "Error"
+                          : "Idle"}
+                    </span>
+                  </div>
+
+                  <p className="mt-0.5 truncate font-mono text-[8px] text-slate-600">
+                    {aiRuntime?.providerDisplayName ||
+                      "Detecting provider..."}
+                  </p>
+                </div>
+              </div>
+
+              <div className="min-w-0 text-right">
+                <div className="truncate font-mono text-[8px] font-semibold text-cyan-400">
+                  {aiRuntime?.returnedModel ||
+                    aiRuntime?.requestedModel ||
+                    "No model activity"}
+                </div>
+
+                <div className="mt-0.5 truncate font-mono text-[7px] text-slate-700">
+                  {aiRuntime?.returnedModel
+                    ? "ACTIVE MODEL"
+                    : aiRuntimeError
+                      ? "STATUS UNAVAILABLE"
+                      : "AWAITING REQUEST"}
+                </div>
+              </div>
+            </div>
+
+            {aiRuntimeError ? (
+              <div className="mt-1.5 truncate border-t border-slate-900 pt-1.5 font-mono text-[7px] text-amber-500/70">
+                {aiRuntimeError}
+              </div>
+            ) : null}
+          </div>
+
+          {/* Model Routing History */}
+          <div className="border-b border-slate-800 bg-slate-950/80 px-4 py-2">
+            <button
+              type="button"
+              onClick={() =>
+                setIsAIRoutingHistoryOpen(
+                  (current) => !current
+                )
+              }
+              className="flex w-full items-center justify-between gap-3 text-left"
+              aria-expanded={isAIRoutingHistoryOpen}
+            >
+              <div className="flex min-w-0 items-center gap-2">
+                <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-cyan-500/15 bg-cyan-500/5">
+                  <Activity className="h-3 w-3 text-cyan-400" />
+                </div>
+
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[8px] font-bold uppercase tracking-wider text-slate-400">
+                      Model Routing History
+                    </span>
+
+                    <span className="rounded border border-slate-800 bg-slate-900 px-1.5 py-0.5 font-mono text-[7px] font-bold text-slate-600">
+                      {aiRuntime?.recentRequests?.length || 0}
+                    </span>
+                  </div>
+
+                  <p className="mt-0.5 truncate font-mono text-[7px] text-slate-700">
+                    Provider attempts and fallback activity
+                  </p>
+                </div>
+              </div>
+
+              {isAIRoutingHistoryOpen ? (
+                <ChevronUp className="h-3.5 w-3.5 shrink-0 text-slate-600" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-600" />
+              )}
+            </button>
+
+            {isAIRoutingHistoryOpen ? (
+              <div className="mt-2 space-y-1.5">
+                {aiRuntime?.recentRequests?.length ? (
+                  aiRuntime.recentRequests.map(
+                    (request, index) => (
+                      <div
+                        key={`${request.timestamp}-${request.attempt}-${index}`}
+                        className="rounded-md border border-slate-800 bg-slate-900/60 px-2.5 py-2"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="truncate font-mono text-[8px] font-semibold text-cyan-400">
+                              {request.requestedModel}
+                            </div>
+
+                            <div className="mt-0.5 flex min-w-0 items-center gap-1.5 font-mono text-[7px] text-slate-600">
+                              <span className="truncate">
+                                {request.returnedModel
+                                  ? `→ ${request.returnedModel}`
+                                  : "→ FAILED"}
+                              </span>
+
+                              <span className="shrink-0 text-slate-800">
+                                •
+                              </span>
+
+                              <span className="shrink-0">
+                                Attempt {request.attempt}
+                              </span>
+                            </div>
+                          </div>
+
+                          <span
+                            className={`shrink-0 rounded border px-1.5 py-0.5 font-mono text-[7px] font-bold uppercase ${
+                              request.success
+                                ? "border-emerald-500/20 bg-emerald-500/5 text-emerald-400"
+                                : "border-amber-500/20 bg-amber-500/5 text-amber-400"
+                            }`}
+                          >
+                            {request.success
+                              ? "Success"
+                              : request.statusCode
+                                ? `${request.statusCode}`
+                                : "Failed"}
+                          </span>
+                        </div>
+
+                        <div className="mt-1.5 flex items-center justify-between gap-2 border-t border-slate-800/80 pt-1.5">
+                          <span className="truncate font-mono text-[7px] text-slate-700">
+                            {request.providerDisplayName}
+                          </span>
+
+                          <span className="shrink-0 font-mono text-[7px] text-slate-700">
+                            {new Date(
+                              request.timestamp
+                            ).toLocaleTimeString()}
+                          </span>
+                        </div>
+
+                        {request.error ? (
+                          <div className="mt-1 truncate font-mono text-[7px] text-amber-500/70">
+                            {request.error}
+                          </div>
+                        ) : null}
+                      </div>
+                    )
+                  )
+                ) : (
+                  <div className="rounded-md border border-dashed border-slate-800 bg-slate-900/30 px-3 py-2.5 text-center font-mono text-[7px] text-slate-700">
+                    No model routing activity recorded yet.
+                  </div>
+                )}
+              </div>
+            ) : null}
+          </div>
+
+          {/* Voice Assistant */}
+          <div className="border-b border-slate-800 bg-slate-950/80 px-4 py-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <div
+                  className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${
+                    voiceState === "listening"
+                      ? "border-cyan-400/50 bg-cyan-400/10 text-cyan-300"
+                      : voiceState === "speaking"
+                        ? "border-emerald-400/50 bg-emerald-400/10 text-emerald-300"
+                        : voiceState === "processing"
+                          ? "border-amber-400/50 bg-amber-400/10 text-amber-300"
+                          : voicePermission === "denied"
+                            ? "border-red-400/30 bg-red-400/5 text-red-400"
+                            : "border-slate-700 bg-slate-900 text-slate-500"
+                  }`}
+                >
+                  {voiceState === "speaking" ? (
+                    <Volume2 className="h-4 w-4" />
+                  ) : voiceState === "listening" ? (
+                    <Mic className="h-4 w-4" />
+                  ) : voicePermission === "denied" ? (
+                    <MicOff className="h-4 w-4" />
+                  ) : (
+                    <Mic className="h-4 w-4" />
+                  )}
+                </div>
+
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[9px] font-bold uppercase tracking-wider text-slate-300">
+                      Voice Assistant
+                    </span>
+
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full ${
+                        voiceState === "listening"
+                          ? "animate-pulse bg-cyan-400"
+                          : voiceState === "speaking"
+                            ? "animate-pulse bg-emerald-400"
+                            : voiceState === "processing"
+                              ? "animate-pulse bg-amber-400"
+                              : voicePermission === "denied"
+                                ? "bg-red-400"
+                                : "bg-slate-600"
+                      }`}
+                    />
+                  </div>
+
+                  <p className="mt-0.5 truncate text-[8px] text-slate-600">
+                    {voicePermission === "denied"
+                      ? "Microphone access denied — text chat remains available"
+                      : voiceState === "listening"
+                        ? "Listening for your command..."
+                        : voiceState === "processing"
+                          ? "CyberLab AI is processing..."
+                          : voiceState === "speaking"
+                            ? "CyberLab AI is speaking..."
+                            : "Say “Hey CyberLab 54321” to activate"}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex shrink-0 items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (voiceState === "listening") {
+                      stopVoiceAssistant();
+                    } else {
+                      void startCommandListening();
+                    }
+                  }}
+                  disabled={
+                    voicePermission !== "granted" ||
+                    voiceState === "processing" ||
+                    voiceState === "speaking"
+                  }
+                  title={
+                    voiceState === "listening"
+                      ? "Stop listening"
+                      : "Start listening"
+                  }
+                  className={`flex h-8 items-center gap-1.5 rounded-lg border px-2.5 font-mono text-[8px] font-bold uppercase tracking-wider transition-colors disabled:cursor-not-allowed disabled:opacity-30 ${
+                    voiceState === "listening"
+                      ? "border-red-400/30 bg-red-400/10 text-red-400 hover:bg-red-400/20"
+                      : "border-cyan-500/30 bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20"
+                  }`}
+                >
+                  {voiceState === "listening" ? (
+                    <>
+                      <Square className="h-2.5 w-2.5" />
+                      Stop
+                    </>
+                  ) : (
+                    <>
+                      <Mic className="h-3 w-3" />
+                      Listen
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-2 flex items-center justify-between border-t border-slate-900 pt-2">
+              <span className="font-mono text-[7px] uppercase tracking-wider text-slate-700">
+                Wake phrase
+              </span>
+
+              <span className="font-mono text-[8px] font-semibold text-cyan-500/70">
+                HEY CYBERLAB 54321
+              </span>
+            </div>
           </div>
 
           {/* Messages */}

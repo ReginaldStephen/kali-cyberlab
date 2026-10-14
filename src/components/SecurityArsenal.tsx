@@ -15,6 +15,11 @@ import {
   Settings,
   CheckCircle2,
   CircleOff,
+  RefreshCw,
+  Target,
+  List,
+  Map,
+  ActivitySquare,
 } from "lucide-react";
 
 interface SecurityArsenalProps {
@@ -22,6 +27,9 @@ interface SecurityArsenalProps {
   onOpenObservium: () => void;
   onOpenGreenbone: () => void;
   onOpenTShark: () => void;
+  onOpenBurp: () => void;
+  onOpenHttpx: () => void;
+  onOpenWazuh: () => void;
 }
 
 interface IntegrationStatus {
@@ -37,6 +45,130 @@ interface IntegrationStatus {
 interface IntegrationStatusResponse {
   timestamp: string;
   integrations: IntegrationStatus[];
+}
+
+interface BurpListener {
+  address: string;
+  port: number;
+  protocol: "tcp" | "unknown";
+  source: string;
+}
+
+interface BurpCapability {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  available: boolean;
+  edition: "community" | "professional" | "unknown";
+  status: "available" | "limited" | "professional" | "not-detected";
+}
+
+interface BurpStatus {
+  installed: boolean;
+  running: boolean;
+  version: string | null;
+  edition: "community" | "professional" | "unknown";
+  pid: number | null;
+  jarPath: string | null;
+  launcherPath: string | null;
+  listeners: BurpListener[];
+  proxyListener: BurpListener | null;
+  launchCommand: string | null;
+  message: string;
+}
+
+interface BurpStatusResponse {
+  success: boolean;
+  status: BurpStatus;
+  timestamp: string;
+}
+
+interface BurpCapabilitiesResponse {
+  success: boolean;
+  edition: "community" | "professional" | "unknown";
+  version: string | null;
+  capabilities: BurpCapability[];
+  timestamp: string;
+}
+
+interface BurpTarget {
+  id: string;
+  name: string;
+  baseUrl: string;
+  host: string;
+  port: number;
+  protocol: "http" | "https" | "unknown";
+  inScope: boolean;
+  enabled: boolean;
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface BurpScopeEntry {
+  id: string;
+  pattern: string;
+  include: boolean;
+  enabled: boolean;
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface BurpHttpRecord {
+  id: string;
+  timestamp: string;
+  method: string;
+  url: string;
+  status: number;
+  requestHeaders: Record<string, string>;
+  requestBody: string;
+  responseHeaders: Record<string, string>;
+  responseBody: string;
+  requestBytes: number;
+  responseBytes: number;
+  durationMs: number;
+  source: string;
+  targetId?: string;
+}
+
+interface BurpSiteMapEntry {
+  id: string;
+  url: string;
+  method: string;
+  host: string;
+  path: string;
+  status: number;
+  contentType: string;
+  responseBytes: number;
+  firstSeen: string;
+  lastSeen: string;
+  source: string;
+}
+
+interface BurpTargetsResponse {
+  success: boolean;
+  targets: BurpTarget[];
+  timestamp: string;
+}
+
+interface BurpScopeResponse {
+  success: boolean;
+  scope: BurpScopeEntry[];
+  timestamp: string;
+}
+
+interface BurpHistoryResponse {
+  success: boolean;
+  history: BurpHttpRecord[];
+  timestamp: string;
+}
+
+interface BurpSiteMapResponse {
+  success: boolean;
+  siteMap: BurpSiteMapEntry[];
+  timestamp: string;
 }
 
 interface SecurityTool {
@@ -66,7 +198,7 @@ const tools: SecurityTool[] = [
     category: "NETWORK MONITORING",
     description:
       "Infrastructure monitoring for network devices, interfaces, traffic, sensors and system health.",
-    url: "http://45.222.128.31/observium",
+    url: "http://127.0.0.1:8081",
     status: "ready",
     icon: Activity,
   },
@@ -85,9 +217,19 @@ const tools: SecurityTool[] = [
     name: "Burp Suite",
     category: "WEB APPLICATION SECURITY",
     description:
-      "Professional web application security testing with Proxy, Repeater, Intruder and Scanner.",
+      "Integrated web application security testing with live Burp status, Proxy, Repeater, HTTP history, testing utilities and edition-aware capabilities.",
     url: "",
     status: "external",
+    icon: Globe,
+  },
+  {
+    id: "httpx",
+    name: "HTTPX / ProjectDiscovery",
+    category: "WEB RECONNAISSANCE",
+    description:
+      "Fast HTTP probing, status detection, technology identification, response telemetry, DNS metadata and web-service reconnaissance.",
+    url: "",
+    status: "online",
     icon: Globe,
   },
   {
@@ -165,6 +307,9 @@ export const SecurityArsenal: React.FC<SecurityArsenalProps> = ({
   onOpenObservium,
   onOpenGreenbone,
   onOpenTShark,
+  onOpenBurp,
+  onOpenHttpx,
+  onOpenWazuh,
 }) => {
     const [integrationStatuses, setIntegrationStatuses] =
     useState<Record<string, IntegrationStatus>>({});
@@ -174,7 +319,38 @@ export const SecurityArsenal: React.FC<SecurityArsenalProps> = ({
 
   const [lastRefresh, setLastRefresh] =
     useState<Date | null>(null);
-    const loadIntegrationStatuses = useCallback(async () => {
+
+  const [burpStatus, setBurpStatus] =
+    useState<BurpStatus | null>(null);
+
+  const [burpCapabilities, setBurpCapabilities] =
+    useState<BurpCapability[]>([]);
+
+  const [burpLoading, setBurpLoading] =
+    useState(true);
+
+  const [burpLaunching, setBurpLaunching] =
+    useState(false);
+
+  const [burpTargets, setBurpTargets] =
+    useState<BurpTarget[]>([]);
+
+  const [burpScope, setBurpScope] =
+    useState<BurpScopeEntry[]>([]);
+
+  const [burpHistory, setBurpHistory] =
+    useState<BurpHttpRecord[]>([]);
+
+  const [burpSiteMap, setBurpSiteMap] =
+    useState<BurpSiteMapEntry[]>([]);
+
+  const [burpDataLoading, setBurpDataLoading] =
+    useState(false);
+
+  const [burpDataError, setBurpDataError] =
+    useState<string | null>(null);
+
+  const loadIntegrationStatuses = useCallback(async () => {
     try {
       setIntegrationLoading(true);
 
@@ -214,19 +390,195 @@ export const SecurityArsenal: React.FC<SecurityArsenalProps> = ({
       setIntegrationLoading(false);
     }
   }, []);
- useEffect(() => {
-  loadIntegrationStatuses();
 
-  const interval = window.setInterval(() => {
+  const loadBurpStatus = useCallback(async () => {
+    try {
+      setBurpLoading(true);
+
+      const [statusResponse, capabilitiesResponse] =
+        await Promise.all([
+          fetch("/api/integrations/burp/status", {
+            credentials: "include",
+          }),
+          fetch("/api/integrations/burp/capabilities", {
+            credentials: "include",
+          }),
+        ]);
+
+      if (!statusResponse.ok) {
+        throw new Error(
+          `Burp status request failed: ${statusResponse.status}`
+        );
+      }
+
+      if (!capabilitiesResponse.ok) {
+        throw new Error(
+          `Burp capability request failed: ${capabilitiesResponse.status}`
+        );
+      }
+
+      const statusData =
+        (await statusResponse.json()) as BurpStatusResponse;
+
+      const capabilitiesData =
+        (await capabilitiesResponse.json()) as BurpCapabilitiesResponse;
+
+      if (statusData.success) {
+        setBurpStatus(statusData.status);
+      }
+
+      if (capabilitiesData.success) {
+        setBurpCapabilities(
+          Array.isArray(capabilitiesData.capabilities)
+            ? capabilitiesData.capabilities
+            : []
+        );
+      }
+    } catch (error) {
+      console.error(
+        "Failed to load Burp Suite integration status:",
+        error
+      );
+    } finally {
+      setBurpLoading(false);
+    }
+  }, []);
+
+  const loadBurpDataPlane = useCallback(async () => {
+    try {
+      setBurpDataLoading(true);
+      setBurpDataError(null);
+
+      const [
+        targetsResponse,
+        scopeResponse,
+        historyResponse,
+        siteMapResponse,
+      ] = await Promise.all([
+        fetch("/api/integrations/burp/targets", {
+          credentials: "include",
+        }),
+        fetch("/api/integrations/burp/scope", {
+          credentials: "include",
+        }),
+        fetch("/api/integrations/burp/history", {
+          credentials: "include",
+        }),
+        fetch("/api/integrations/burp/site-map", {
+          credentials: "include",
+        }),
+      ]);
+
+      const [
+        targetsPayload,
+        scopePayload,
+        historyPayload,
+        siteMapPayload,
+      ] = await Promise.all([
+        targetsResponse.json(),
+        scopeResponse.json(),
+        historyResponse.json(),
+        siteMapResponse.json(),
+      ]);
+
+      if (!targetsResponse.ok || !targetsPayload?.success) {
+        throw new Error(
+          targetsPayload?.error ||
+          "Unable to load Burp targets."
+        );
+      }
+
+      if (!scopeResponse.ok || !scopePayload?.success) {
+        throw new Error(
+          scopePayload?.error ||
+          "Unable to load Burp scope."
+        );
+      }
+
+      if (!historyResponse.ok || !historyPayload?.success) {
+        throw new Error(
+          historyPayload?.error ||
+          "Unable to load Burp HTTP history."
+        );
+      }
+
+      if (!siteMapResponse.ok || !siteMapPayload?.success) {
+        throw new Error(
+          siteMapPayload?.error ||
+          "Unable to load Burp site map."
+        );
+      }
+
+      const targetsData =
+        targetsPayload as BurpTargetsResponse;
+
+      const scopeData =
+        scopePayload as BurpScopeResponse;
+
+      const historyData =
+        historyPayload as BurpHistoryResponse;
+
+      const siteMapData =
+        siteMapPayload as BurpSiteMapResponse;
+
+      setBurpTargets(
+        Array.isArray(targetsData.targets)
+          ? targetsData.targets
+          : []
+      );
+
+      setBurpScope(
+        Array.isArray(scopeData.scope)
+          ? scopeData.scope
+          : []
+      );
+
+      setBurpHistory(
+        Array.isArray(historyData.history)
+          ? historyData.history
+          : []
+      );
+
+      setBurpSiteMap(
+        Array.isArray(siteMapData.siteMap)
+          ? siteMapData.siteMap
+          : []
+      );
+    } catch (error: any) {
+      console.error(
+        "Failed to load Burp data plane:",
+        error
+      );
+
+      setBurpDataError(
+        error?.message ||
+        "Unable to load Burp data-plane telemetry."
+      );
+    } finally {
+      setBurpDataLoading(false);
+    }
+  }, []);
+
+
+  useEffect(() => {
     loadIntegrationStatuses();
-  }, 30000);
+    loadBurpStatus();
+    loadBurpDataPlane();
 
-  return () => {
-    window.clearInterval(interval);
-  };
-}, [
-  loadIntegrationStatuses,
-]);
+    const interval = window.setInterval(() => {
+      loadIntegrationStatuses();
+      loadBurpStatus();
+      loadBurpDataPlane();
+    }, 30000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [
+    loadIntegrationStatuses,
+    loadBurpStatus,
+    loadBurpDataPlane,
+  ]);
 
   const formatCheckedAt = (
     value: string | undefined
@@ -256,6 +608,52 @@ export const SecurityArsenal: React.FC<SecurityArsenalProps> = ({
     }
 
     onLaunch(tool.url);
+  };
+
+  const handleLaunchBurp = async () => {
+    try {
+      setBurpLaunching(true);
+
+      const response = await fetch(
+        "/api/integrations/burp/launch",
+        {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        throw new Error(
+          data?.error ||
+          data?.message ||
+          `Burp launch failed with HTTP ${response.status}`
+        );
+      }
+
+      await new Promise((resolve) =>
+        window.setTimeout(resolve, 1500)
+      );
+
+      await loadBurpStatus();
+      await loadBurpDataPlane();
+    } catch (error: any) {
+      console.error(
+        "Failed to launch Burp Suite:",
+        error
+      );
+
+      alert(
+        error?.message ||
+        "Unable to launch Burp Suite."
+      );
+    } finally {
+      setBurpLaunching(false);
+    }
   };
 
  return (
@@ -384,15 +782,25 @@ export const SecurityArsenal: React.FC<SecurityArsenalProps> = ({
           integrationStatuses[tool.id];
 
         const effectiveStatus =
-          integration?.status === "online"
-            ? "online"
-            : integration?.status === "offline"
-              ? "offline"
-              : integration?.status === "not-configured"
-                ? "not-configured"
-                : tool.status;
+          tool.id === "burp" && burpStatus
+            ? burpStatus.running
+              ? "online"
+              : burpStatus.installed
+                ? "offline"
+                : "not-configured"
+            : integration?.status === "online"
+              ? "online"
+              : integration?.status === "offline"
+                ? "offline"
+                : integration?.status === "not-configured"
+                  ? "not-configured"
+                  : tool.status;
 
-        const status = statusConfig[effectiveStatus];
+        const status =
+          effectiveStatus === "not-configured"
+            ? statusConfig.offline
+            : statusConfig[effectiveStatus];
+
         const StatusIcon = status.icon;
 
         return (
@@ -509,22 +917,33 @@ export const SecurityArsenal: React.FC<SecurityArsenalProps> = ({
 
               <button
                 onClick={() =>
-                tool.id === "greenbone"
-                ? onOpenGreenbone()
-                : tool.id === "observium"
-                ? onOpenObservium()
-                : tool.id === "tshark"
-                ? onOpenTShark()
-                : handleLaunch(tool)
+                  tool.id === "greenbone"
+                    ? onOpenGreenbone()
+                    : tool.id === "observium"
+                      ? onOpenObservium()
+                      : tool.id === "tshark"
+                        ? onOpenTShark()
+                        : tool.id === "burp"
+                          ? onOpenBurp()
+                          : tool.id === "httpx"
+                            ? onOpenHttpx()
+                            : tool.id === "wazuh"
+                              ? onOpenWazuh()
+                              : handleLaunch(tool)
                 }
-                className="flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-white transition-colors hover:bg-emerald-500"
+                disabled={false}
+                className="flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-white transition-colors hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <ExternalLink className="h-3.5 w-3.5" />
+
                 {tool.id === "greenbone" ||
                 tool.id === "observium" ||
-                tool.id === "tshark"
-                ? "Open Dashboard"
-                : "Launch Tool"}
+                tool.id === "tshark" ||
+                tool.id === "burp" ||
+                tool.id === "httpx" ||
+                tool.id === "wazuh"
+                  ? "Open Dashboard"
+                  : "Launch Tool"}
               </button>
 
               <button

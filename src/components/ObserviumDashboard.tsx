@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { ObserviumTopology } from "./ObserviumTopology";
 import {
   Activity,
   AlertTriangle,
@@ -7,6 +8,7 @@ import {
   HardDrive,
   MemoryStick,
   Network,
+  Plus,
   RefreshCw,
   Server,
   ShieldCheck,
@@ -129,6 +131,38 @@ interface ObserviumOverviewResponse {
   };
 }
 
+type ObserviumSnmpVersion = "v1" | "v2c" | "v3";
+
+type ObserviumSnmpSecurityLevel =
+  | "noAuthNoPriv"
+  | "authNoPriv"
+  | "authPriv";
+
+interface ObserviumDeviceForm {
+  hostname: string;
+  version: ObserviumSnmpVersion;
+  port: string;
+  transport: string;
+  context: string;
+  community: string;
+  securityLevel: ObserviumSnmpSecurityLevel;
+  username: string;
+  authPassword: string;
+  authAlgorithm: string;
+  privacyPassword: string;
+  privacyAlgorithm: string;
+}
+
+interface ObserviumActionResponse {
+  ok: boolean;
+  error?: string;
+  exitCode?: number | null;
+  timedOut?: boolean;
+  stdout?: string;
+  stderr?: string;
+  device?: ObserviumDevice | null;
+}
+
 interface ObserviumDashboardProps {
   onBack?: () => void;
 }
@@ -206,9 +240,26 @@ const statusIsOnline = (device: ObserviumDevice): boolean => {
   );
 };
 
+const createInitialDeviceForm = (): ObserviumDeviceForm => ({
+  hostname: "",
+  version: "v2c",
+  port: "161",
+  transport: "udp",
+  context: "",
+  community: "",
+  securityLevel: "authPriv",
+  username: "",
+  authPassword: "",
+  authAlgorithm: "SHA",
+  privacyPassword: "",
+  privacyAlgorithm: "AES",
+});
+
 export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
   onBack,
 }) => {
+  const [showTopology, setShowTopology] = useState(false);
+
   const [devices, setDevices] = useState<ObserviumDevice[]>([]);
 
   const [overview, setOverview] =
@@ -226,6 +277,243 @@ export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
   const [error, setError] = useState<string | null>(null);
 
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+
+  const [showAddDevice, setShowAddDevice] = useState(false);
+  const [deviceForm, setDeviceForm] =
+    useState<ObserviumDeviceForm>(createInitialDeviceForm);
+  const [deviceActionLoading, setDeviceActionLoading] =
+    useState<string | null>(null);
+  const [deviceActionMessage, setDeviceActionMessage] =
+    useState<string | null>(null);
+  const [deviceActionError, setDeviceActionError] =
+    useState<string | null>(null);
+
+  const updateDeviceForm = (
+    field: keyof ObserviumDeviceForm,
+    value: string
+  ) => {
+    setDeviceForm((current) => ({
+      ...current,
+      [field]: value,
+    }));
+  };
+
+  const managementPayload = () => ({
+    hostname: deviceForm.hostname.trim(),
+    version: deviceForm.version,
+    port: Number(deviceForm.port || 161),
+    transport: deviceForm.transport,
+    context: deviceForm.context.trim() || undefined,
+    community:
+      deviceForm.version === "v3"
+        ? undefined
+        : deviceForm.community,
+    securityLevel:
+      deviceForm.version === "v3"
+        ? deviceForm.securityLevel
+        : undefined,
+    username:
+      deviceForm.version === "v3"
+        ? deviceForm.username.trim()
+        : undefined,
+    authPassword:
+      deviceForm.version === "v3"
+        ? deviceForm.authPassword
+        : undefined,
+    authAlgorithm:
+      deviceForm.version === "v3"
+        ? deviceForm.authAlgorithm
+        : undefined,
+    privacyPassword:
+      deviceForm.version === "v3" &&
+      deviceForm.securityLevel === "authPriv"
+        ? deviceForm.privacyPassword
+        : undefined,
+    privacyAlgorithm:
+      deviceForm.version === "v3" &&
+      deviceForm.securityLevel === "authPriv"
+        ? deviceForm.privacyAlgorithm
+        : undefined,
+  });
+
+  const parseManagementResponse = async (
+    response: Response,
+    fallback: string
+  ): Promise<ObserviumActionResponse> => {
+    const data = (await response.json().catch(() => null)) as
+      | ObserviumActionResponse
+      | null;
+
+    if (!response.ok) {
+      throw new Error(data?.error || fallback);
+    }
+
+    if (!data) {
+      throw new Error(fallback);
+    }
+
+    return data;
+  };
+
+  const testDeviceConnection = async () => {
+    try {
+      setDeviceActionLoading("test");
+      setDeviceActionMessage(null);
+      setDeviceActionError(null);
+
+      const response = await fetch(
+        "/api/integrations/observium/devices/test",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(managementPayload()),
+        }
+      );
+
+      const data = await parseManagementResponse(
+        response,
+        "Unable to test the Observium SNMP connection."
+      );
+
+      if (!data.ok) {
+        throw new Error(
+          data.error ||
+            data.stderr ||
+            data.stdout ||
+            "Observium SNMP connection test failed."
+        );
+      }
+
+      setDeviceActionMessage(
+        "SNMP connection test succeeded. The device is reachable with the supplied credentials."
+      );
+    } catch (err: any) {
+      console.error("Observium device test error:", err);
+      setDeviceActionError(
+        err?.message ||
+          "Unable to test the Observium SNMP connection."
+      );
+    } finally {
+      setDeviceActionLoading(null);
+    }
+  };
+
+  const addDevice = async () => {
+    try {
+      setDeviceActionLoading("add");
+      setDeviceActionMessage(null);
+      setDeviceActionError(null);
+
+      const response = await fetch(
+        "/api/integrations/observium/devices",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(managementPayload()),
+        }
+      );
+
+      const data = await parseManagementResponse(
+        response,
+        "Unable to add the Observium device."
+      );
+
+      if (!data.ok) {
+        throw new Error(
+          data.error ||
+            data.stderr ||
+            data.stdout ||
+            "Observium rejected the device."
+        );
+      }
+
+      setDeviceActionMessage(
+        "Device added to Observium successfully."
+      );
+
+      setDeviceForm(createInitialDeviceForm());
+
+      await loadDevices();
+      await loadOverview();
+
+      window.setTimeout(() => {
+        setShowAddDevice(false);
+        setDeviceActionMessage(null);
+        setDeviceActionError(null);
+      }, 900);
+    } catch (err: any) {
+      console.error("Observium device add error:", err);
+      setDeviceActionError(
+        err?.message ||
+          "Unable to add the Observium device."
+      );
+    } finally {
+      setDeviceActionLoading(null);
+    }
+  };
+
+  const runDeviceOperation = async (
+    deviceId: number,
+    operation: "discover" | "poll"
+  ) => {
+    const actionKey = `${operation}:${deviceId}`;
+
+    try {
+      setDeviceActionLoading(actionKey);
+      setDeviceActionMessage(null);
+      setDeviceActionError(null);
+
+      const response = await fetch(
+        `/api/integrations/observium/devices/${deviceId}/${operation}`,
+        {
+          method: "POST",
+        }
+      );
+
+      const data = await parseManagementResponse(
+        response,
+        `Unable to ${operation} the Observium device.`
+      );
+
+      if (!data.ok) {
+        throw new Error(
+          data.error ||
+            data.stderr ||
+            data.stdout ||
+            `Observium ${operation} operation failed.`
+        );
+      }
+
+      setDeviceActionMessage(
+        operation === "discover"
+          ? "Observium discovery completed successfully."
+          : "Observium poll completed successfully."
+      );
+
+      await loadDevices();
+      await loadOverview();
+
+      if (selectedDeviceId === deviceId) {
+        await loadDeviceDetails(deviceId);
+      }
+    } catch (err: any) {
+      console.error(
+        `Observium device ${operation} error:`,
+        err
+      );
+
+      setDeviceActionError(
+        err?.message ||
+          `Unable to ${operation} the Observium device.`
+      );
+    } finally {
+      setDeviceActionLoading(null);
+    }
+  };
 
   const loadDevices = useCallback(async () => {
     try {
@@ -399,6 +687,10 @@ export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
     );
   }, [deviceDetails]);
 
+  if (showTopology) {
+    return <ObserviumTopology onBack={() => setShowTopology(false)} />;
+  }
+
   return (
     <section className="space-y-5">
       {/* Header */}
@@ -438,6 +730,29 @@ export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
                 Back
               </button>
             )}
+
+            <button
+              type="button"
+              onClick={() => {
+                setDeviceActionMessage(null);
+                setDeviceActionError(null);
+                setDeviceForm(createInitialDeviceForm());
+                setShowAddDevice(true);
+              }}
+              className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-[9px] font-bold uppercase tracking-wider text-emerald-400 transition hover:bg-emerald-500/20"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              Add Device
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowTopology(true)}
+              className="inline-flex items-center gap-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-[9px] font-bold uppercase tracking-wider text-sky-400 transition hover:bg-sky-500/20"
+            >
+              <Network className="h-3.5 w-3.5" />
+              Topology
+            </button>
 
             <button
               type="button"
@@ -874,6 +1189,44 @@ export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
                     >
                       View Details
                     </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        runDeviceOperation(
+                          device.device_id,
+                          "discover"
+                        )
+                      }
+                      disabled={
+                        deviceActionLoading !== null
+                      }
+                      className="rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-[9px] font-bold uppercase tracking-wider text-sky-400 transition hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {deviceActionLoading ===
+                      `discover:${device.device_id}`
+                        ? "Discovering..."
+                        : "Discover"}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        runDeviceOperation(
+                          device.device_id,
+                          "poll"
+                        )
+                      }
+                      disabled={
+                        deviceActionLoading !== null
+                      }
+                      className="rounded-lg border border-violet-500/30 bg-violet-500/10 px-3 py-2 text-[9px] font-bold uppercase tracking-wider text-violet-400 transition hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {deviceActionLoading ===
+                      `poll:${device.device_id}`
+                        ? "Polling..."
+                        : "Poll"}
+                    </button>
                   </div>
                 </div>
               );
@@ -881,6 +1234,391 @@ export const ObserviumDashboard: React.FC<ObserviumDashboardProps> = ({
           </div>
         )}
       </div>
+
+      {(deviceActionMessage || deviceActionError) && (
+        <div
+          className={`rounded-lg border px-4 py-3 text-[10px] ${
+            deviceActionError
+              ? "border-red-500/20 bg-red-500/5 text-red-300"
+              : "border-emerald-500/20 bg-emerald-500/5 text-emerald-300"
+          }`}
+        >
+          <div className="font-bold uppercase tracking-widest">
+            {deviceActionError ? "Observium Action Failed" : "Observium Action"}
+          </div>
+          <div className="mt-1 leading-5">
+            {deviceActionError || deviceActionMessage}
+          </div>
+        </div>
+      )}
+
+      {showAddDevice && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
+          <div className="max-h-[92vh] w-full max-w-3xl overflow-y-auto rounded-xl border border-slate-700 bg-slate-950 shadow-2xl">
+            <div className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-slate-800 bg-slate-950 px-5 py-4">
+              <div>
+                <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-emerald-400">
+                  OBSERVIUM DEVICE MANAGEMENT
+                </div>
+
+                <div className="mt-1 text-lg font-bold text-slate-100">
+                  Add Monitored Device
+                </div>
+
+                <div className="mt-1 text-[10px] leading-5 text-slate-600">
+                  Add the device to Observium using its native SNMP configuration.
+                  Credentials are sent directly to the CyberLab backend and are
+                  never returned to the browser after the operation.
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (deviceActionLoading) return;
+                  setShowAddDevice(false);
+                  setDeviceActionMessage(null);
+                  setDeviceActionError(null);
+                }}
+                disabled={deviceActionLoading !== null}
+                className="rounded-lg border border-slate-800 bg-slate-900 p-2 text-slate-500 transition hover:border-slate-700 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-40"
+                aria-label="Close add device dialog"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="space-y-5 p-5">
+              <div className="grid gap-4 md:grid-cols-2">
+                <label className="block">
+                  <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                    Hostname / IP Address
+                  </span>
+                  <input
+                    value={deviceForm.hostname}
+                    onChange={(event) =>
+                      updateDeviceForm(
+                        "hostname",
+                        event.target.value
+                      )
+                    }
+                    placeholder="192.168.1.1 or switch01.example.local"
+                    autoComplete="off"
+                    className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 font-mono text-xs text-slate-200 outline-none transition placeholder:text-slate-700 focus:border-emerald-500/50"
+                  />
+                </label>
+
+                <label className="block">
+                  <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                    SNMP Version
+                  </span>
+                  <select
+                    value={deviceForm.version}
+                    onChange={(event) =>
+                      updateDeviceForm(
+                        "version",
+                        event.target.value
+                      )
+                    }
+                    className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                  >
+                    <option value="v1">SNMP v1</option>
+                    <option value="v2c">SNMP v2c</option>
+                    <option value="v3">SNMP v3</option>
+                  </select>
+                </label>
+
+                <label className="block">
+                  <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                    SNMP Port
+                  </span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="65535"
+                    value={deviceForm.port}
+                    onChange={(event) =>
+                      updateDeviceForm(
+                        "port",
+                        event.target.value
+                      )
+                    }
+                    className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 font-mono text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                  />
+                </label>
+
+                <label className="block">
+                  <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                    Transport
+                  </span>
+                  <select
+                    value={deviceForm.transport}
+                    onChange={(event) =>
+                      updateDeviceForm(
+                        "transport",
+                        event.target.value
+                      )
+                    }
+                    className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                  >
+                    <option value="udp">UDP</option>
+                    <option value="udp6">UDP6</option>
+                    <option value="tcp">TCP</option>
+                    <option value="tcp6">TCP6</option>
+                  </select>
+                </label>
+              </div>
+
+              {deviceForm.version !== "v3" ? (
+                <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
+                  <div className="text-[9px] font-bold uppercase tracking-widest text-emerald-400">
+                    SNMP COMMUNITY
+                  </div>
+
+                  <div className="mt-3 grid gap-4 md:grid-cols-2">
+                    <label className="block">
+                      <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                        Community
+                      </span>
+                      <input
+                        type="password"
+                        value={deviceForm.community}
+                        onChange={(event) =>
+                          updateDeviceForm(
+                            "community",
+                            event.target.value
+                          )
+                        }
+                        autoComplete="new-password"
+                        placeholder="SNMP community"
+                        className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                      />
+                    </label>
+
+                    <label className="block">
+                      <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                        Context
+                      </span>
+                      <input
+                        value={deviceForm.context}
+                        onChange={(event) =>
+                          updateDeviceForm(
+                            "context",
+                            event.target.value
+                          )
+                        }
+                        placeholder="Optional SNMP context"
+                        className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                      />
+                    </label>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-4 rounded-lg border border-slate-800 bg-slate-900/40 p-4">
+                  <div className="text-[9px] font-bold uppercase tracking-widest text-emerald-400">
+                    SNMPV3 SECURITY
+                  </div>
+
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <label className="block">
+                      <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                        Security Level
+                      </span>
+                      <select
+                        value={deviceForm.securityLevel}
+                        onChange={(event) =>
+                          updateDeviceForm(
+                            "securityLevel",
+                            event.target.value
+                          )
+                        }
+                        className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                      >
+                        <option value="noAuthNoPriv">
+                          noAuthNoPriv
+                        </option>
+                        <option value="authNoPriv">
+                          authNoPriv
+                        </option>
+                        <option value="authPriv">
+                          authPriv
+                        </option>
+                      </select>
+                    </label>
+
+                    <label className="block">
+                      <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                        Username
+                      </span>
+                      <input
+                        value={deviceForm.username}
+                        onChange={(event) =>
+                          updateDeviceForm(
+                            "username",
+                            event.target.value
+                          )
+                        }
+                        autoComplete="off"
+                        placeholder="SNMPv3 username"
+                        className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                      />
+                    </label>
+                  </div>
+
+                  {deviceForm.securityLevel !== "noAuthNoPriv" && (
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <label className="block">
+                        <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                          Authentication Password
+                        </span>
+                        <input
+                          type="password"
+                          value={deviceForm.authPassword}
+                          onChange={(event) =>
+                            updateDeviceForm(
+                              "authPassword",
+                              event.target.value
+                            )
+                          }
+                          autoComplete="new-password"
+                          className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                        />
+                      </label>
+
+                      <label className="block">
+                        <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                          Authentication Algorithm
+                        </span>
+                        <select
+                          value={deviceForm.authAlgorithm}
+                          onChange={(event) =>
+                            updateDeviceForm(
+                              "authAlgorithm",
+                              event.target.value
+                            )
+                          }
+                          className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                        >
+                          <option value="MD5">MD5</option>
+                          <option value="SHA">SHA</option>
+                          <option value="SHA-224">SHA-224</option>
+                          <option value="SHA-256">SHA-256</option>
+                          <option value="SHA-384">SHA-384</option>
+                          <option value="SHA-512">SHA-512</option>
+                        </select>
+                      </label>
+                    </div>
+                  )}
+
+                  {deviceForm.securityLevel === "authPriv" && (
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <label className="block">
+                        <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                          Privacy Password
+                        </span>
+                        <input
+                          type="password"
+                          value={deviceForm.privacyPassword}
+                          onChange={(event) =>
+                            updateDeviceForm(
+                              "privacyPassword",
+                              event.target.value
+                            )
+                          }
+                          autoComplete="new-password"
+                          className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                        />
+                      </label>
+
+                      <label className="block">
+                        <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                          Privacy Algorithm
+                        </span>
+                        <select
+                          value={deviceForm.privacyAlgorithm}
+                          onChange={(event) =>
+                            updateDeviceForm(
+                              "privacyAlgorithm",
+                              event.target.value
+                            )
+                          }
+                          className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                        >
+                          <option value="DES">DES</option>
+                          <option value="AES">AES</option>
+                          <option value="AES-192">AES-192</option>
+                          <option value="AES-192-C">AES-192-C</option>
+                          <option value="AES-256">AES-256</option>
+                          <option value="AES-256-C">AES-256-C</option>
+                        </select>
+                      </label>
+                    </div>
+                  )}
+
+                  <label className="block">
+                    <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                      Context
+                    </span>
+                    <input
+                      value={deviceForm.context}
+                      onChange={(event) =>
+                        updateDeviceForm(
+                          "context",
+                          event.target.value
+                        )
+                      }
+                      placeholder="Optional SNMP context"
+                      className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-xs text-slate-200 outline-none focus:border-emerald-500/50"
+                    />
+                  </label>
+                </div>
+              )}
+
+              {(deviceActionMessage || deviceActionError) && (
+                <div
+                  className={`rounded-lg border px-4 py-3 text-[10px] leading-5 ${
+                    deviceActionError
+                      ? "border-red-500/20 bg-red-500/5 text-red-300"
+                      : "border-emerald-500/20 bg-emerald-500/5 text-emerald-300"
+                  }`}
+                >
+                  {deviceActionError || deviceActionMessage}
+                </div>
+              )}
+
+              <div className="flex flex-col-reverse gap-2 border-t border-slate-800 pt-4 sm:flex-row sm:justify-end">
+                <button
+                  type="button"
+                  onClick={testDeviceConnection}
+                  disabled={
+                    deviceActionLoading !== null ||
+                    !deviceForm.hostname.trim()
+                  }
+                  className="rounded-lg border border-sky-500/30 bg-sky-500/10 px-4 py-2.5 text-[9px] font-bold uppercase tracking-wider text-sky-400 transition hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {deviceActionLoading === "test"
+                    ? "Testing..."
+                    : "Test Connection"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={addDevice}
+                  disabled={
+                    deviceActionLoading !== null ||
+                    !deviceForm.hostname.trim()
+                  }
+                  className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 text-[9px] font-bold uppercase tracking-wider text-emerald-400 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {deviceActionLoading === "add"
+                    ? "Adding..."
+                    : "Add Device"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Device detail panel */}
       {selectedDeviceId !== null && (

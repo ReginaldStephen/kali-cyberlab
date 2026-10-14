@@ -868,6 +868,18 @@ function buildCyberLabPdfHtml(
                 "host"
               ) || "N/A";
 
+            const hostname =
+              getFindingText(
+                finding,
+                "hostname"
+              ) || "";
+
+            const port =
+              getFindingText(
+                finding,
+                "port"
+              ) || "";
+
             const category =
               getFindingText(
                 finding,
@@ -903,7 +915,8 @@ function buildCyberLabPdfHtml(
               getFindingText(
                 finding,
                 "cvss",
-                "cvssScore"
+                "cvssScore",
+                "severityScore"
               );
 
             return `
@@ -940,6 +953,39 @@ function buildCyberLabPdfHtml(
                       cvss || "N/A"
                     )}</strong>
                   </div>
+
+                  <div>
+                    <span class="label">Host</span>
+                    <strong>${escapeHtml(
+                      target || "N/A"
+                    )}</strong>
+                  </div>
+
+                  ${
+                    hostname
+                      ? `
+                        <div>
+                          <span class="label">Hostname</span>
+                          <strong>${escapeHtml(
+                            hostname
+                          )}</strong>
+                        </div>
+                      `
+                      : ""
+                  }
+
+                  ${
+                    port
+                      ? `
+                        <div>
+                          <span class="label">Port</span>
+                          <strong>${escapeHtml(
+                            port
+                          )}</strong>
+                        </div>
+                      `
+                      : ""
+                  }
                 </div>
 
                 ${
